@@ -1,5 +1,5 @@
 # xray-tproxy
-A transparent proxy based on the Tproxy documentation in Project X [here]([url](https://xtls.github.io/Xray-docs-next/en/document/level-2/tproxy.html)https://xtls.github.io/Xray-docs-next/en/document/level-2/tproxy.html).
+A transparent proxy based on the Tproxy documentation in Project X [here](https://xtls.github.io/Xray-docs-next/en/document/level-2/tproxy.html).
 
 # How to use
 1. Install dependencies: 
