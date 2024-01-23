@@ -2,7 +2,7 @@
 A transparent proxy based on the Tproxy documentation in Project X [here](https://xtls.github.io/Xray-docs-next/en/document/level-2/tproxy.html).
 
 # How to use
-1. Install dependencies: 
+1. Install dependencies: (Make sure xray is available in /usr/bin/)
 
     `sudo pacman -S xray nftables iptables`
 
