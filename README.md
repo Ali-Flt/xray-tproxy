@@ -6,7 +6,7 @@ A transparent proxy based on the Tproxy documentation in Project X [here](https:
 
     `sudo pacman -S xray nftables iptables`
 
-2. Create `config.json` based on `config.json.example` and replace the first outbound connection with your own. Also make sure to change all instances of your.domain.name, your_uuid, put.your.ipv4.address, ... elsewhere.
+2. Create `config.json` based on `config.json.example` and replace the first outbound connection with your own. Also make sure to change all instances of your.domain.name, your_uuid, put.your.ipv4.address, ... elsewhere. You can export your outbound connection using xray clients such as [nekoray](https://github.com/MatsuriDayo/nekoray).
 3. Copy config.json to /etc/xray/: 
 
     `sudo cp config.json /etc/xray/config.json`
