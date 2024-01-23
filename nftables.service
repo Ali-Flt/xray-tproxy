@@ -1,0 +1,21 @@
+[Unit]
+Description=nftables
+Documentation=man:nft(8) http://wiki.nftables.org
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardInput=null
+ProtectSystem=full
+ProtectHome=true
+ExecStart=/usr/sbin/nft -f /etc/nftables.conf ; /usr/sbin/ip route add local default dev lo table 100 ; /usr/sbin/ip rule add fwmark 1 table 100
+ExecReload=/usr/sbin/nft -f /etc/nftables.conf
+ExecStop=/usr/sbin/nft flush ruleset ; /usr/sbin/ip route del local default dev lo table 100 ; /usr/sbin/ip rule del table 100
+
+[Install]
+WantedBy=sysinit.target
+
