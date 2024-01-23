@@ -1,6 +1,7 @@
 #!/bin/bash
 
 cp ./config.json /etc/xray/config.json
+cp ./xray.service /usr/lib/systemd/system/xray.service
 cp ./nftables.conf /etc/nftables.conf
 cp ./nftables.service /lib/systemd/system/nftables.service
 systemctl daemon-reload
