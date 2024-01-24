@@ -51,3 +51,9 @@ A transparent proxy based on the Tproxy documentation in Project X [here](https:
 
 
 Steps 3 to 9 can be done automatically using `sudo ./xray-tproxy.sh`
+
+
+# Donations
+Consider buying me a coffee if this helped you.
+
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/aflt)
