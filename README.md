@@ -2,14 +2,26 @@
 A transparent proxy based on the Tproxy documentation in Project X [here](https://xtls.github.io/Xray-docs-next/en/document/level-2/tproxy.html).
 
 # How to use
-1. Install dependencies: (Make sure xray is available in /usr/bin/)
+1. Install dependencies:
 
-    `sudo pacman -S xray nftables iptables`
+- xray in `/usr/bin/xray`
+- nft (Netfliter) in `/usr/sbin/nft`
+- ip in `/usr/sbin/ip`
+    
 
-2. Create `config.json` based on `config.json.example` and replace the first outbound connection with your own. Also make sure to change all instances of your.domain.name, your_uuid, put.your.ipv4.address, ... elsewhere. You can export your outbound connection using xray clients such as [nekoray](https://github.com/MatsuriDayo/nekoray).
+2. Create `config.json` based on `config.json.example` and replace the first outbound connection with your own. Also make sure to change all instances of your.domain.name, your_uuid, put.your.ipv4.address, ... elsewhere. You can export your outbound connection using xray clients such as [nekoray](https://github.com/MatsuriDayo/nekoray). Make sure to keep this section in the outbound settings:
+```json
+"streamSettings": {
+    "sockopt": {
+        "mark": 2
+        },
+    ...
+}
+```
 3. Copy config.json to /etc/xray/: 
 
     `sudo mkdir /etc/xray/`
+   
     `sudo cp config.json /etc/xray/config.json`
    
 4. Copy xray.service to /usr/lib/systemd/system/:
@@ -39,3 +51,9 @@ A transparent proxy based on the Tproxy documentation in Project X [here](https:
 
 
 Steps 3 to 9 can be done automatically using `sudo ./xray-tproxy.sh`
+
+
+# Donations
+Consider buying me a coffee if this helped you.
+
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/aflt)
