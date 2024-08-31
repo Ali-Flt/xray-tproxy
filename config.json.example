@@ -105,21 +105,11 @@
         }
     ],
     "dns": {
-        "hosts": {
-          "your.domain.name": "put.your.ipv4.address"
-        },
         "servers": [
             {
-                "address": "https://8.8.8.8/dns-query",
-                "domains": [],
-                "queryStrategy": ""
-            },
-            {
-                "address": "https+local://223.5.5.5/dns-query",
-                "domains": [
-                    "full:your.domain.name"
-                ],
-                "queryStrategy": ""
+                "address": "78.157.42.101",
+                "port": 53,
+                "domains": ["full:your.domain.name"]
             },
             "8.8.8.8",
             "1.1.1.1"
@@ -135,6 +125,14 @@
                 ],
                 "port": 53,
                 "outboundTag": "dns-out"
+            },
+            {
+                "type": "field",
+                "ip": [
+                    "78.157.42.101",
+                    "78.157.42.100"
+                ],
+                "outboundTag": "direct"
             },
             {
                 "type": "field",
