@@ -52,6 +52,9 @@ A transparent proxy based on the Tproxy documentation in Project X [here](https:
 
 Steps 3 to 9 can be done automatically using `sudo ./xray-tproxy.sh`
 
+# Notes:
+
+You can also update the outbound connection from a subscription periodically with a cronjob that runs the `python update_outbound_from_sub.py`. The script requires the `python-v2ray` package (`pip install python-v2ray`). The connection with the best ping is selected.   
 
 # Donations
 Consider buying me a coffee if this helped you.
