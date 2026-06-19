@@ -9,7 +9,7 @@ A transparent proxy based on the Tproxy documentation in Project X [here](https:
 - ip in `/usr/sbin/ip`
     
 
-2. Create `config.json` based on `config.json.example` and replace the first outbound connection with your own. Also make sure to change all instances of your.domain.name, your_uuid, put.your.ipv4.address, ... elsewhere. You can export your outbound connection using xray clients such as [nekoray](https://github.com/MatsuriDayo/nekoray). Make sure to keep this section in the outbound settings:
+2. Create `config.json` based on `config.json.example` **(or `config_2.json.example` if you want only specific domains to go through proxy)** and replace the first outbound connection with your own. Also make sure to change all instances of your.domain.name, your_uuid, put.your.ipv4.address, ... elsewhere. You can export your outbound connection using xray clients such as [v2rayN](https://github.com/2dust/v2rayn). Make sure to keep this section in the outbound settings:
 ```json
 "streamSettings": {
     "sockopt": {
