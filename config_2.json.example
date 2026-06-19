@@ -1,0 +1,192 @@
+{
+  "dns": {
+    "servers": [
+      "8.8.8.8",
+      "8.8.4.4",
+      "78.157.42.101",
+      "1.1.1.1",
+      {
+        "address": "1.0.0.1",
+        "finalQuery": true
+      },
+      {
+        "address": "78.157.42.100",
+        "domains": [
+          "domain:youtube.com",
+          "geosite:instagram",
+          "geosite:netflix",
+          "geosite:spotify",
+          ...
+        ],
+        "finalQuery": true,
+        "tag": "dnsproxy"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "172.17.0.1",
+      "port": 2080,
+      "protocol": "mixed",
+      "settings": {
+        "allowTransparent": false,
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls"
+        ],
+        "enabled": true,
+        "routeOnly": false
+      },
+      "tag": "local_proxy"
+    },
+    {
+      "port": 12345,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "followRedirect": true,
+        "network": "tcp,udp"
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls"
+        ],
+        "enabled": true
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tproxy": "tproxy"
+        }
+      },
+      "tag": "all-in"
+    }
+  ],
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "debug",
+    "dnsLog": true
+  },
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "streamSettings": {
+        "sockopt": {
+          "mark": 2
+        }
+      },
+      "tag": "direct"
+    },
+    {
+        "domainStrategy": "AsIs",
+        "flow": null,
+        "protocol": "vless",
+        "settings": {
+            "vnext": [
+                {
+                    "address": "your.domain.name",
+                    "port": 443,
+                    "users": [
+                        {
+                            "encryption": "none",
+                            "flow": "",
+                            "id": "your_uuid"
+                        }
+                    ]
+                }
+            ]
+        },
+        "streamSettings": {
+            "sockopt": {
+                "mark": 2
+            },
+            "network": "ws",
+            "security": "tls",
+            "tlsSettings": {
+                "alpn": [
+                    "h2",
+                    "http/1.1"
+                ],
+                "fingerprint": "firefox",
+                "serverName": "your.domain.name"
+            },
+            "wsSettings": {
+                "path": "/users"
+            }
+        },
+        "tag": "proxy"
+    },
+    {
+      "protocol": "blackhole",
+      "settings": {
+        "response": {
+          "type": "http"
+        }
+      },
+      "tag": "block"
+    },
+    {
+      "protocol": "dns",
+      "settings": {
+        "address": "8.8.8.8"
+      },
+      "streamSettings": {
+        "sockopt": {
+          "mark": 2
+        }
+      },
+      "tag": "dns-out"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "ip": [
+          "geoip:telegram"
+        ],
+        "outboundTag": "proxy",
+        "type": "field"
+      },
+      {
+        "inboundTag": ["dnsproxy"],
+        "outboundTag": "proxy"
+      },
+      {
+        "domain": [
+          "domain:youtube.com",
+          "geosite:instagram",
+          "geosite:netflix",
+          "geosite:spotify",
+          ...
+        ],
+        "outboundTag": "proxy",
+        "type": "field"
+      },
+      {
+        "inboundTag": [
+          "all-in"
+        ],
+        "outboundTag": "dns-out",
+        "port": 53,
+        "type": "field"
+      },
+      {
+        "domain": [
+          "geosite:category-ads-all"
+        ],
+        "outboundTag": "block",
+        "type": "field"
+      },
+      {
+        "outboundTag": "direct",
+        "port": "0-65535",
+        "type": "field"
+      }
+    ]
+  }
+}
