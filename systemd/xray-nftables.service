@@ -23,7 +23,7 @@ ProtectHome=true
 # Idempotent: `add` fails if the rule is already there, which on a restart
 # would abort the unit; deleting first and ignoring the failure is stable.
 ExecStartPre=-/usr/sbin/ip rule del fwmark 1 table 100
-ExecStart=/usr/sbin/nft -f /etc/nftables.conf
+ExecStart=/usr/sbin/nft -f /etc/xray/nftables.conf
 # `replace` rather than `add`, same reason.
 ExecStart=/usr/sbin/ip route replace local default dev lo table 100
 # This is what makes the output chain work: a locally generated packet cannot
@@ -31,7 +31,7 @@ ExecStart=/usr/sbin/ip route replace local default dev lo table 100
 # to a table whose local default route turns it back into prerouting.
 ExecStart=/usr/sbin/ip rule add fwmark 1 table 100
 
-ExecReload=/usr/sbin/nft -f /etc/nftables.conf
+ExecReload=/usr/sbin/nft -f /etc/xray/nftables.conf
 
 # ⚠ `nft flush ruleset` used to be here. It wipes EVERY table in the system,
 # including whatever firewall you were relying on, and this unit only ever owns

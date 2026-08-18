@@ -44,6 +44,26 @@ Hysteria had the same hole.
 > nftables resolves `meta skuid xray` to a numeric uid at parse time.
 > The ruleset will not load if the `xray` user does not exist yet, which is why `install.sh` creates it first.
 
+## What install.sh puts where
+
+| repo file | installed to |
+|---|---|
+| `nftables.conf` | `/etc/xray/nftables.conf` |
+| `systemd/xray.service` | `/usr/lib/systemd/system/xray.service` |
+| `systemd/xray-nftables.service` | `/usr/lib/systemd/system/xray-nftables.service` |
+| `conf/*.json`, if present | `/etc/xray/conf/` |
+
+Both are namespaced on purpose.
+A unit called `nftables.service` overwrites the one the distro's nftables package ships, and `/etc/nftables.conf` is that package's config file.
+Installing over both means a package update silently reverts the capture, or the distro's own ruleset flushes this one.
+
+`install.sh` refuses to overwrite a populated `/etc/xray/conf`, because that is where your pools and your hand-edited routing live.
+It re-installs the units and the ruleset with `--force-units`.
+It validates the config with `xray -test` before enabling anything: starting the capture with a config xray will not load is how a transparent proxy takes the whole host offline, since the ruleset happily tproxies every packet at a port with nothing behind it.
+
+The tools themselves are not installed.
+Run `sub2xray.py`, `alive.sh` and `wg-peer.sh` from the clone, with `XRAY_CONFDIR=/etc/xray/conf`.
+
 ## Layout
 
 | file | owner | holds |

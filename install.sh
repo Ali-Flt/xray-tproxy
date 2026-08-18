@@ -60,9 +60,13 @@ put() {   # put <src> <dst> - never clobber without --force-units
     install -m 0644 "$1" "$2"; echo "wrote  $2"
   fi
 }
-put nftables.conf            /etc/nftables.conf
-put systemd/xray.service     /usr/lib/systemd/system/xray.service
-put systemd/nftables.service /usr/lib/systemd/system/nftables.service
+# ⚠ Namespaced on purpose. A unit called nftables.service overwrites the one
+# the distro's nftables package ships, and /etc/nftables.conf is that
+# package's config file - installing over both means a package update
+# silently reverts the capture, or its ruleset flushes ours.
+put nftables.conf                 /etc/xray/nftables.conf
+put systemd/xray.service          /usr/lib/systemd/system/xray.service
+put systemd/xray-nftables.service /usr/lib/systemd/system/xray-nftables.service
 
 systemctl daemon-reload
 
@@ -72,18 +76,18 @@ systemctl daemon-reload
 if compgen -G "/etc/xray/conf/*.json" >/dev/null; then
   if xray -test -confdir /etc/xray/conf; then
     systemctl enable --now xray.service
-    systemctl enable --now nftables.service   # PartOf=xray, so it follows it
+    systemctl enable --now xray-nftables.service   # PartOf=xray, so it follows it
     echo
-    echo "up. check:  systemctl status xray nftables"
+    echo "up. check:  systemctl status xray xray-nftables"
     echo "            journalctl -u xray -f"
   else
     echo
     echo "config did not pass -test; nothing was started." >&2
-    echo "Fix /etc/xray/conf, then: systemctl enable --now xray nftables" >&2
+    echo "Fix /etc/xray/conf, then: systemctl enable --now xray xray-nftables" >&2
     exit 1
   fi
 else
   echo
   echo "no config yet, so nothing was started. Generate the confdir above, then:"
-  echo "  systemctl enable --now xray nftables"
+  echo "  systemctl enable --now xray xray-nftables"
 fi
