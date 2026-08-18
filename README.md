@@ -70,6 +70,35 @@ Hysteria had the same hole.
 > nftables resolves `meta skuid xray` to a numeric uid at parse time.
 > The ruleset will not load if the `xray` user does not exist yet, which is why `install.sh` creates it first.
 
+## Ports that stay direct
+
+`KEEP_DIRECT_PORTS` in `nftables.conf` is `{ 22, 2080, 8585 }`, and those ports bypass the proxy **in both directions**.
+
+The two directions exist for different reasons, and the second one is not optional:
+
+- **Inbound.** A connection arriving on a public interface matches neither `RESERVED_IP` nor `192.168.0.0/16`, so without the exemption it is TPROXY'd into the transparent door instead of reaching the listener it was addressed to.
+- **Outbound.** A connection this host *makes* to one of these ports must not be marked either.
+
+> ⚠ The invariant is: **whatever `prerouting` will not TPROXY, `output` must not mark.**
+> Break it and you get a black hole, not a fallback.
+> A marked packet is routed to `lo` by the `fwmark 1` rule and comes back round to `prerouting`, which then declines to TPROXY it - but the decision to deliver it locally has already been made, and nothing is listening for the remote address.
+> The packet is dropped, with no log line anywhere.
+> `git pull` over ssh hitting `Connection timed out` after ~2 minutes is what that looks like.
+
+Adding a port to the set covers both directions at once, which is why it is one define rather than two.
+Taking `22` out to get outgoing ssh proxied would also stop protecting inbound ssh, which is a good way to lock yourself out of a remote box.
+
+If you want github over ssh to go through the pool rather than direct, do it in ssh rather than in nftables:
+
+```
+# ~/.ssh/config
+Host github.com
+  Hostname ssh.github.com
+  Port 443
+```
+
+GitHub serves ssh on 443, which is not in the set and is routed like any other traffic.
+
 ## What install.sh puts where
 
 | repo file | installed to |
