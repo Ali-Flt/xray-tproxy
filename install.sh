@@ -78,7 +78,11 @@ systemctl daemon-reload
 if compgen -G "/etc/xray/conf/*.json" >/dev/null; then
   if xray -test -confdir /etc/xray/conf; then
     systemctl enable --now xray.service
-    systemctl enable --now xray-nftables.service   # PartOf=xray, so it follows it
+    # Explicitly, and NOT because PartOf carries it: PartOf propagates stop and
+    # restart, never start. Bringing up xray alone leaves the ruleset unloaded,
+    # which fails silently - nothing is captured, everything goes out direct,
+    # and no log says the proxy is not in the path.
+    systemctl enable --now xray-nftables.service
     echo
     echo "up. check:  systemctl status xray xray-nftables"
     echo "            journalctl -u xray -f"

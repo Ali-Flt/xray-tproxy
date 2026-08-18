@@ -8,11 +8,37 @@ the tproxy ruleset, systemd units and installer from `xray-tproxy`, and the conf
 Both histories are preserved here.
 
 ```sh
-sudo ./install.sh                                              # user, units, ruleset
+sudo ./install.sh                                              # user, dirs, units, ruleset
 export XRAY_CONFDIR=/etc/xray/conf
 sudo -E ./sub2xray.py init                                     # once, hand-edit after
 sudo -E ./sub2xray.py pool --name main --size 20 sub.txt       # every refresh
-sudo systemctl restart xray
+sudo ./install.sh                                              # validates, then starts both
+```
+
+`install.sh` is idempotent, and the second run is not a typo.
+The first has no config to check yet, so it installs the pieces and starts nothing.
+The second finds the confdir, runs `xray -test` against it, and only then enables `xray` and `xray-nftables`.
+
+**Both services, and the second one will not follow the first.**
+`xray-nftables` is `PartOf=xray.service`, which propagates *stop and restart* but not *start*.
+Bringing up xray on its own therefore leaves the ruleset unloaded, and that failure is silent: nothing is captured, everything reaches the internet directly, and no log anywhere says the proxy is not in the path.
+If you would rather do it by hand, the command is `systemctl enable --now xray xray-nftables`, not `restart xray`.
+
+To confirm the capture is actually in the path, rather than merely that xray is running:
+
+```sh
+systemctl is-active xray xray-nftables   # both must say active
+sudo nft list table ip xray | head       # the ruleset is loaded
+ip rule show | grep 'fwmark 0x1'         # the policy route exists
+```
+
+All three, because the first passing on its own is the silent case above.
+
+Once both are up, a pool refresh is just:
+
+```sh
+sudo -E ./sub2xray.py pool --name main --size 20 sub.txt
+sudo systemctl restart xray        # PartOf reloads the ruleset with it
 ```
 
 ## The loop, and the two rules that stop it
