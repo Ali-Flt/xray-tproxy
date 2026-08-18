@@ -193,6 +193,22 @@ grep -q 'prox-de-1	ss.example' <<<"$out" || die "an ss node showed no address: $
 [[ $(tags) == '["prox-de-2"]' ]] || die "an ss node could not be pruned: $(tags)"
 ok "a shadowsocks outbound is reported with its address and can be pruned"
 
+# REGRESSION: mktemp creates 0600 and mv puts the SOURCE's mode and owner on
+# the destination, so a prune rewrote the pool file rw------- and xray, running
+# as its own user, could not read its own config afterwards. Under sudo it
+# changed the owner to root too. Nothing said so: the prune reported success
+# and the service failed to load at the next restart.
+reset_pool; chmod 644 "$work/conf/50-pool-de-1.json"; journal "$W"
+"$ALIVE" --prune >/dev/null
+[[ $(tags) == '["prox-de-1","prox-de-3"]' ]] || die "the mode test did not prune"
+[[ "$(stat -c %a "$work/conf/50-pool-de-1.json")" == "644" ]] \
+  || die "prune changed the pool file mode to $(stat -c %a "$work/conf/50-pool-de-1.json")"
+reset_pool; chmod 640 "$work/conf/50-pool-de-1.json"; journal "$W"
+"$ALIVE" --prune >/dev/null
+[[ "$(stat -c %a "$work/conf/50-pool-de-1.json")" == "640" ]] \
+  || die "prune did not preserve 640, got $(stat -c %a "$work/conf/50-pool-de-1.json")"
+ok "a prune leaves the pool file's permissions exactly as it found them"
+
 # --help is generated from the header comment, so it breaks silently if the
 # sed range stops matching. Pin both ends of that range.
 out=$("$ALIVE" --help)
@@ -304,9 +320,17 @@ if [[ $PRUNE -eq 1 ]]; then
     tags=$(jq -Rn '[inputs | select(length > 0)]' <<<"$failed")
     for f in "$CONFDIR"/50-pool-*.json; do
       tmp=$(mktemp "$CONFDIR/.prune.XXXXXX")
+      # mktemp creates the file 0600, and mv carries the SOURCE's mode and
+      # owner onto the destination rather than keeping the destination's. So a
+      # prune rewrote every pool file it touched to rw------- root:root, and
+      # xray - which runs as its own user - could no longer read its own
+      # config. Put the original's metadata on the replacement before renaming.
       jq --argjson t "$tags" \
         '.outbounds |= map(select(.tag as $x | $t | index($x) | not))' \
-        "$f" > "$tmp" && mv "$tmp" "$f"
+        "$f" > "$tmp" \
+        && chmod --reference="$f" "$tmp" \
+        && { chown --reference="$f" "$tmp" 2>/dev/null || true; } \
+        && mv "$tmp" "$f"
       # If pruning emptied the pool, remove the file entirely rather than
       # leaving a skeleton {"outbounds":[]}.  Keeps the config dir tidy and
       # prevents a silent zero-size outbound list from being loaded by xray.

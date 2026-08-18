@@ -271,6 +271,7 @@ The dead list is measured; alive at that level only ever means *not reported fai
 `--prune` deletes the dead outbound from its pool file.
 Nothing is kept, deliberately: the subscriptions are the source, so regenerating from them is the recovery.
 The delete is per-file `mktemp`+`mv`, so a crash cannot leave a half-written pool.
+The replacement is given the original's mode and owner before the rename, because `mktemp` creates `0600` and `mv` carries the *source's* metadata onto the destination: without that step a prune leaves the pool file `rw-------` and, under `sudo`, owned by root, after which xray cannot read its own config and says so only at the next restart.
 The running service keeps its old config until you restart it.
 
 **`ALIVE_MIN` (default 1) refuses a prune that would leave fewer than N nodes**, and says so on stdout with the exact override to type.

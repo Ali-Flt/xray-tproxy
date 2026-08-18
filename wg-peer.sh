@@ -80,7 +80,13 @@ mkdir -p "$WG_STATE/peers"
 # edit the wireguard inbound in place, atomically (temp file on same fs → rename)
 edit_conf() {
   local tmp; tmp=$(mktemp "$(dirname "$XRAY_CONF")/.wg-peer.XXXXXX")
-  jq "$@" "$XRAY_CONF" > "$tmp" && mv "$tmp" "$XRAY_CONF"
+  # Same trap as alive.sh's prune: mktemp is 0600 and mv carries the source's
+  # mode and owner across, so every peer change used to tighten this file until
+  # xray could not read it. Copy the original's metadata over before renaming.
+  jq "$@" "$XRAY_CONF" > "$tmp" \
+    && chmod --reference="$XRAY_CONF" "$tmp" \
+    && { chown --reference="$XRAY_CONF" "$tmp" 2>/dev/null || true; } \
+    && mv "$tmp" "$XRAY_CONF"
 }
 
 # Just the inbound. dns, blackhole and every routing rule belong to
@@ -361,6 +367,17 @@ selftest() {
   # the private key file holds a secret; so does the .conf beside it
   [[ "$(stat -c %a "$WG_STATE/peers/carol.conf")" == "600" ]] \
     || { echo "FAIL: peer .conf is not 600" >&2; exit 1; }
+  # REGRESSION: edit_conf writes through mktemp (0600) + mv, and mv carries the
+  # source's mode across. Every peer change used to tighten the config until
+  # xray could not read it, silently and one `add` at a time.
+  chmod 644 "$XRAY_CONF"
+  cmd_add erin >/dev/null 2>&1
+  [[ "$(stat -c %a "$XRAY_CONF")" == "644" ]] \
+    || { echo "FAIL: edit_conf changed the config mode to $(stat -c %a "$XRAY_CONF")" >&2; exit 1; }
+  cmd_remove erin >/dev/null 2>&1
+  [[ "$(stat -c %a "$XRAY_CONF")" == "644" ]] \
+    || { echo "FAIL: remove changed the config mode" >&2; exit 1; }
+
   # a changed endpoint reaches existing peers
   WG_ENDPOINT="new.example:51820" cmd_regen carol >/dev/null 2>&1
   grep -q "Endpoint = new.example:51820" "$WG_STATE/peers/carol.conf" \
