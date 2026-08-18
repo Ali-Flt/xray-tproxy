@@ -1067,6 +1067,15 @@ if __name__ == "__main__":
                         "vless": args.vless_listen,
                         "vless_id": args.vless_id,
                         "loglevel": args.loglevel}, args.force)
+        # Said out loud at the moment the config is written, not only in --help.
+        # An open relay is found by scanners in days and the first symptom is
+        # somebody else's traffic, which is a long way from this file. Narrowing
+        # --proxy-listen silences it, so it stays a signal rather than a nag.
+        if args.proxy_listen in ("0.0.0.0", "::"):
+            print(f"note: socks/http on {args.proxy_listen}:{args.proxy_port} is "
+                  f"auth:noauth, so it is an open proxy to anything that can "
+                  f"route here.\n      Firewall that port, or narrow it: "
+                  f"--proxy-listen <lan-or-bridge-addr>", file=sys.stderr)
         if args.vless_listen:
             print(f"vless inbound uuid: "
                   f"{read_vless_id(os.path.join(args.outdir, INBOUNDS))}",
