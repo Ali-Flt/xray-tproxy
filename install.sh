@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install — put the system pieces in place. Run once, as root.
+# install - put the system pieces in place. Run once, as root.
 #
 #   ./install.sh                 install units + ruleset, seed /etc/xray/conf
 #   ./install.sh --force-units   overwrite units and nftables.conf, keep conf/
@@ -30,7 +30,7 @@ done
 
 # ⚠ Before the ruleset. nftables resolves `meta skuid xray` to a numeric uid at
 # PARSE time, so a ruleset referencing a user that does not exist yet fails to
-# load with "User does not exist" — and that rule is the one that stops xray
+# load with "User does not exist" - and that rule is the one that stops xray
 # capturing its own traffic.
 if ! id -u xray >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin xray
@@ -47,13 +47,13 @@ else
     chown -R xray:xray /etc/xray/conf
     echo "seeded /etc/xray/conf from ./conf"
   else
-    echo "empty  /etc/xray/conf — generate it:"
+    echo "empty  /etc/xray/conf - generate it:"
     echo "         XRAY_CONFDIR=/etc/xray/conf $PWD/sub2xray.py init"
     echo "         XRAY_CONFDIR=/etc/xray/conf $PWD/sub2xray.py pool --name main <sub>"
   fi
 fi
 
-put() {   # put <src> <dst> — never clobber without --force-units
+put() {   # put <src> <dst> - never clobber without --force-units
   if [[ -e "$2" && $FORCE_UNITS -eq 0 ]] && ! cmp -s "$1" "$2"; then
     echo "kept   $2 (differs; --force-units to overwrite)"
   else

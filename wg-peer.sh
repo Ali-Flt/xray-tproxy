@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# wg-peer — one-shot WireGuard peer management for an Xray wireguard inbound.
+# wg-peer - one-shot WireGuard peer management for an Xray wireguard inbound.
 #
 #   wg-peer add <name>      the normal path. Seeds the wireguard inbound into
-#                           $XRAY_CONF if absent, with NO exit outbound — the
+#                           $XRAY_CONF if absent, with NO exit outbound - the
 #                           confdir's balancer is the exit. Existing peers in
 #                           $WG_STATE are adopted back in, so a lost config is
 #                           recoverable: keys and IPs live in the state dir.
@@ -33,7 +33,7 @@
 # `xray run -confdir /etc/xray/conf` serves socks, http and wireguard from one
 # process and peer traffic exits through the pool balancer.
 #
-# This file carries the wireguard inbound and NOTHING else — no outbound, no
+# This file carries the wireguard inbound and NOTHING else - no outbound, no
 # rules. An inbound never dials an outbound directly in Xray; everything crosses
 # the dispatcher and the routing rules, so a wireguard inbound needs no outbound
 # of its own, only a rule that reaches one. 10-routing.json's catch-all is that
@@ -48,18 +48,18 @@
 # everything out through the balancer.
 #
 # The server key is generated on first use and spliced into the config's
-# secretKey — UNLESS the config already has a real secretKey, which is then
+# secretKey - UNLESS the config already has a real secretKey, which is then
 # adopted so an already-running setup is never clobbered.
 #
 # Losing $XRAY_CONF is survivable; losing $WG_STATE is not. The state dir holds
 # the server key and every peer's key and .conf, and `init`/`add` rebuild the
 # config's peer list from it. A peer whose .conf is gone keeps its key but must
-# be renumbered — its device then needs the new config, and you are warned.
+# be renumbered - its device then needs the new config, and you are warned.
 set -euo pipefail
 
 # One confdir, shared with sub2xray.py via the same env var and the same default.
 # Relative to cwd, so a systemd unit needs WorkingDirectory= or an absolute
-# XRAY_CONFDIR — a service started elsewhere would otherwise make its own ./conf.
+# XRAY_CONFDIR - a service started elsewhere would otherwise make its own ./conf.
 # The name sorts before 10-routing.json, which costs nothing today (this file has
 # no rules) and keeps the inbound ahead of the routing it depends on.
 XRAY_CONFDIR="${XRAY_CONFDIR:-conf}"
@@ -84,7 +84,7 @@ edit_conf() {
 }
 
 # Just the inbound. dns, blackhole and every routing rule belong to
-# 10-routing.json — duplicating them here is how two files start disagreeing.
+# 10-routing.json - duplicating them here is how two files start disagreeing.
 write_skeleton() {
   mkdir -p "$(dirname "$XRAY_CONF")"
   cat > "$XRAY_CONF" <<JSON
@@ -109,7 +109,7 @@ ensure_base() {
     echo "  or point both at one place with XRAY_CONFDIR" >&2
     exit 1; }
   write_skeleton
-  echo "seeded wireguard inbound at $XRAY_CONF — exits via the confdir balancer" >&2
+  echo "seeded wireguard inbound at $XRAY_CONF - exits via the confdir balancer" >&2
 }
 
 ensure_server_key() {
@@ -124,7 +124,7 @@ ensure_server_key() {
     wg pubkey < "$WG_STATE/server.key" > "$WG_STATE/server.pub"
   fi
   # splice the key into the config whenever it's missing or still a placeholder
-  # (covers fresh config against an existing state key — e.g. re-init)
+  # (covers fresh config against an existing state key - e.g. re-init)
   local cur
   cur=$(jq -r '.inbounds[]|select(.protocol=="wireguard")|.settings.secretKey // ""' "$XRAY_CONF")
   if [[ -z "$cur" || "$cur" == "<"* ]]; then
@@ -155,7 +155,7 @@ EOF
   mv "$tmp" "$f"
 }
 
-# Re-add peers that exist in state but are missing from the config — the case
+# Re-add peers that exist in state but are missing from the config - the case
 # where the config was lost while $WG_STATE survived. Idempotent: a peer already
 # in the config is skipped, so this is safe to run on every add.
 #
@@ -173,7 +173,7 @@ adopt_peers() {
       continue
     fi
     # guarded, not `2>/dev/null`: sed exits 2 on a missing file, and under
-    # `set -euo pipefail` that aborts the run — in exactly the recovery case
+    # `set -euo pipefail` that aborts the run - in exactly the recovery case
     ip=""
     if [[ -f "$WG_STATE/peers/$name.conf" ]]; then
       ip=$(sed -n 's#^Address *= *\([0-9.]\{1,\}\)/32.*#\1#p' \
@@ -181,7 +181,7 @@ adopt_peers() {
     fi
     if [[ -z "$ip" ]]; then
       ip=$(next_ip)
-      echo "warning: $name has no saved .conf — renumbered to $ip; the config on that device is now stale, re-send it (wg-peer qr $name)" >&2
+      echo "warning: $name has no saved .conf - renumbered to $ip; the config on that device is now stale, re-send it (wg-peer qr $name)" >&2
       write_peer_conf "$name" "$ip" || true
     fi
     edit_conf --arg pk "$pub" --arg ip "$ip/32" \
@@ -239,8 +239,8 @@ cmd_remove() {
 }
 
 # Put everything back in agreement from whatever survived. The two records hold
-# a peer's address independently — the config in allowedIPs, the client .conf in
-# Address — so either can rebuild the other:
+# a peer's address independently - the config in allowedIPs, the client .conf in
+# Address - so either can rebuild the other:
 #
 #   config gone, .conf kept  -> reseed, adopt_peers restores it from .conf
 #   .conf gone, config kept  -> rewritten below from the config
@@ -262,7 +262,7 @@ cmd_regen() {
     ip=$(jq -r --arg pk "$pub" '.inbounds[]|select(.protocol=="wireguard")
           |.settings.peers[]?|select(.publicKey==$pk)|.allowedIPs[0]' "$XRAY_CONF" | head -1)
     if [[ -z "$ip" ]]; then
-      echo "skip $name: not in $XRAY_CONF — run: wg-peer add $name" >&2; continue
+      echo "skip $name: not in $XRAY_CONF - run: wg-peer add $name" >&2; continue
     fi
     if write_peer_conf "$name" "${ip%/32}"; then
       echo "rewrote  $WG_STATE/peers/$name.conf ($ip)" >&2
@@ -293,7 +293,7 @@ selftest() {
   cmd_list | grep -q "$WG_SUBNET.3/32" || { echo "FAIL: bob not .3" >&2; exit 1; }
   cmd_remove alice >/dev/null
   [[ $(cmd_list | wc -l) -eq 1 ]] || { echo "FAIL: expected 1 peer after remove" >&2; exit 1; }
-  # next add reuses the freed slot? no — monotonic, should be .4
+  # next add reuses the freed slot? no - monotonic, should be .4
   cmd_add carol >/dev/null
   cmd_list | grep -q "$WG_SUBNET.4/32" || { echo "FAIL: carol not .4" >&2; exit 1; }
 
@@ -315,7 +315,7 @@ selftest() {
   cmd_list | grep -q "$WG_SUBNET.3/32	$pub_bob"   || { echo "FAIL: bob lost his IP" >&2; exit 1; }
   cmd_list | grep -q "$WG_SUBNET.4/32	$pub_carol" || { echo "FAIL: carol lost her IP" >&2; exit 1; }
   cmd_list | grep -q "$WG_SUBNET.5/32" || { echo "FAIL: dave not .5 after adopt" >&2; exit 1; }
-  # the seeded file carries the inbound only — no outbounds, no rules to disagree with
+  # the seeded file carries the inbound only - no outbounds, no rules to disagree with
   jq -e 'has("outbounds")|not' "$XRAY_CONF" >/dev/null || { echo "FAIL: skeleton has outbounds" >&2; exit 1; }
   jq -e 'has("routing")|not'   "$XRAY_CONF" >/dev/null || { echo "FAIL: skeleton has routing" >&2; exit 1; }
   # the server key is reused, so configs already on devices still authenticate
@@ -353,7 +353,7 @@ selftest() {
   [[ -f "$WG_STATE/peers/carol.conf" ]] || { echo "FAIL: regen wrote nothing" >&2; exit 1; }
   grep -q "Address = $ip_carol" "$WG_STATE/peers/carol.conf" \
     || { echo "FAIL: regen changed carol's address" >&2; exit 1; }
-  # the config is untouched — regen rebuilds files, it does not re-key
+  # the config is untouched - regen rebuilds files, it does not re-key
   cmd_list | grep -q "$ip_carol	$pub_carol" || { echo "FAIL: regen disturbed config" >&2; exit 1; }
   # a second identical regen must report unchanged and not touch the file
   cmd_regen carol > "$d/r2.log" 2>&1

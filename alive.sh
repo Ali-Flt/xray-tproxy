@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# alive — which nodes the running service says are dead, and delete them.
+# alive - which nodes the running service says are dead, and delete them.
 #
 #   ./alive.sh                    report only
 #   ./alive.sh --prune            delete the dead
@@ -26,7 +26,7 @@
 # It greps two lines, which sit at different log levels:
 #   [Warning] app/observatory/burst: error ping <dest> with <tag>: <err>   dead
 #   [Debug]   app/observatory/burst: burst: checking <tag>                 probed
-# At the default `warning` you get every death and no proof of life — enough to
+# At the default `warning` you get every death and no proof of life - enough to
 # prune, not enough to claim a node answered. The summary says which it had.
 # Raise it with: sub2xray.py init --force --loglevel debug
 #
@@ -36,7 +36,7 @@
 #   unrelated servers.
 # ⚠ The RUNNING service keeps its old config until restarted, so after a prune
 #   the journal describes a pool that no longer matches the files on disk.
-# ⚠ Never grep "the outbound X is dead" — that is the PLAIN observatory's
+# ⚠ Never grep "the outbound X is dead" - that is the PLAIN observatory's
 #   message; burstObservatory never emits it, so it reports a perfect pool.
 set -euo pipefail
 
@@ -87,8 +87,8 @@ reset_pool() {
 EOF
 }
 tags() { jq -cr '[.outbounds[].tag]' "$work/conf/50-pool-de-1.json"; }
-ok() { echo "  ok — $1"; }
-die() { echo "FAIL — $1" >&2; exit 1; }
+ok() { echo "  ok - $1"; }
+die() { echo "FAIL - $1" >&2; exit 1; }
 
 # The default case: a service at warning logs failures and no coverage.
 reset_pool; journal "$W"
@@ -106,7 +106,7 @@ reset_pool; journal "$D1" "$D2" "$D3" "$W"
 out=$("$ALIVE")
 grep -q '2 answered' <<<"$out" || die "debug-level run did not confirm answers: $out"
 [[ $(tags) == '["prox-de-1","prox-de-2","prox-de-3"]' ]] || die "report-only wrote to the pool"
-ok "with debug lines present it confirms who answered — and no flag means no writes"
+ok "with debug lines present it confirms who answered - and no flag means no writes"
 
 # A window that only reached part of the pool must not read as a verdict.
 reset_pool; journal "$D1" "$D2" "$W"
@@ -116,7 +116,7 @@ grep -q 'only 2 of 3 were probed' <<<"$out" \
 ok "a partial window says so instead of reading as a verdict"
 
 # The healthy case used to be the broken one: grep matched nothing, and set -e
-# killed the script mid-assignment — no summary, no prune, exit 1.
+# killed the script mid-assignment - no summary, no prune, exit 1.
 reset_pool; journal "$D1" "$D2" "$D3"
 out=$("$ALIVE" --prune)
 grep -q 'nothing to prune' <<<"$out" || die "all-alive run never reached the prune block: $out"
@@ -141,7 +141,7 @@ reset_pool; journal "$W"
 [[ $(tags) == '["prox-de-1","prox-de-2","prox-de-3"]' ]] || die "a rejected run still wrote"
 ok "a mistyped flag errors instead of being silently dropped"
 
-# A window with no failures at all must say so — it is indistinguishable from a
+# A window with no failures at all must say so - it is indistinguishable from a
 # broken failure-grep, and that is exactly the state this tool sat in for a day.
 reset_pool; journal 'vpn xray[1]: nothing useful here'
 out=$("$ALIVE" 2>&1)
@@ -168,7 +168,7 @@ grep -q '2 of 4 outbounds failed' <<<"$out" || die "prefix-numbered tags broke t
 grep -q 'prox-de-40' <<<"$out" || die "the DEAD list was truncated: $out"
 ok "tags whose numbers prefix one another do not truncate the report or the prune"
 
-# The journal names nodes that are no longer in the pool — pruned earlier, or
+# The journal names nodes that are no longer in the pool - pruned earlier, or
 # hand-added in 60-manual.json. They used to print as "?" and take the counts
 # negative: "19 of 2 outbounds failed ... the other -17".
 reset_pool
@@ -207,7 +207,7 @@ echo "selftest ok"
 (( ! RUNTEST )) || { selftest; exit 0; }
 command -v jq >/dev/null || { echo "jq not on PATH" >&2; exit 1; }
 compgen -G "$CONFDIR/50-pool-*.json" >/dev/null || {
-  echo "no pool files in $CONFDIR — run: sub2xray.py pool --name <name> <sub>" >&2; exit 1; }
+  echo "no pool files in $CONFDIR - run: sub2xray.py pool --name <name> <sub>" >&2; exit 1; }
 
 # Counted before anything is deleted, or the denominator would describe the pool
 # we just shrank rather than the one we read about.
@@ -220,7 +220,7 @@ journalctl "$SCOPE" -u "$UNIT" --since "$SINCE" --no-pager > "$work/probe.log" 2
 
 # || true on both: grep exits 1 when it matches nothing, and with `set -e` that
 # killed the script mid-assignment. A pool where NOTHING failed is the healthy
-# case and it died silently — no DEAD section, no summary, no prune, exit 1.
+# case and it died silently - no DEAD section, no summary, no prune, exit 1.
 failed=$(grep -oE 'error ping .* with prox-[a-zA-Z0-9_-]+:' "$work/probe.log" \
          | grep -oE 'prox-[a-zA-Z0-9_-]+' | sort -u || true)
 checked=$(grep -oE 'burst: checking prox-[a-zA-Z0-9_-]+' "$work/probe.log" \
@@ -231,13 +231,13 @@ pool_tags() { jq -r '.outbounds[]?.tag' "$CONFDIR"/50-pool-*.json 2>/dev/null \
 
 # The journal outlives the config: nodes pruned an hour ago still appear in it,
 # and hand-added outbounds (60-manual.json) were never in the pool glob at all.
-# Both used to print with "?" for an address and drag the counts below zero —
+# Both used to print with "?" for an address and drag the counts below zero -
 # "19 of 2 outbounds failed ... the other -17". Only tags that are in the pool
 # files can be reported against or pruned, so drop the rest and say how many.
 in_pool=$(pool_tags)
 stale=$(awk 'NR==FNR{p[$0];next} NF && !($0 in p)' <(echo "$in_pool") <(echo "$failed"))
 failed=$(awk 'NR==FNR{p[$0];next} NF &&  ($0 in p)' <(echo "$in_pool") <(echo "$failed"))
-[[ -z "$stale" ]] || printf 'note: %s failing tag(s) not in %s/50-pool-*.json — already pruned, or hand-added\n' \
+[[ -z "$stale" ]] || printf 'note: %s failing tag(s) not in %s/50-pool-*.json - already pruned, or hand-added\n' \
   "$(grep -c . <<<"$stale")" "$CONFDIR"
 coverage=observed
 if [[ -z "$checked" ]]; then          # service is below debug: deaths, no proof of life
@@ -258,11 +258,11 @@ n_failed=$(grep -c . <<<"$failed" || true)
 (( n_failed > 0 )) || {
   echo "note: NOT ONE failure line matched in $SINCE." >&2
   echo "If you expect dead nodes, either the window is too short or the wording" >&2
-  echo "differs — deadness is read from 'error ping ... with <tag>:' alone." >&2
+  echo "differs - deadness is read from 'error ping ... with <tag>:' alone." >&2
   echo "Capture the evidence: ALIVE_KEEP_LOG=1 $0" >&2; }
 
 # awk, not join. `join` needs both inputs sorted BY THE JOIN FIELD, while sort -u
-# orders whole lines — with tags like prox-x-4 / prox-x-40 / prox-x-6 the two
+# orders whole lines - with tags like prox-x-4 / prox-x-40 / prox-x-6 the two
 # disagree, and join then prints a PARTIAL list and exits 1. Under pipefail that
 # killed the script mid-report: no DEAD section, no prune, no summary, exit 1,
 # and the `2>/dev/null` that used to be here hid the reason. awk needs no order.
@@ -278,7 +278,7 @@ show "$failed" "DEAD"
 
 if [[ $PRUNE -eq 1 ]]; then
   # Refuse to leave fewer than ALIVE_MIN nodes. Everything failing usually means
-  # the run was bad — your uplink, DNS, the probe destination — not that every
+  # the run was bad - your uplink, DNS, the probe destination - not that every
   # node died at once. Default 1 refuses only when nothing at all survives.
   # This guards the CRON path, which a dry run cannot: a scheduled run passes
   # --prune by definition and nobody reads its output. Raise MIN above 1 once
@@ -291,7 +291,7 @@ if [[ $PRUNE -eq 1 ]]; then
     echo
     echo "  REFUSED to prune: $n_ok would be left, ALIVE_MIN is $MIN. Nothing changed."
     echo "  Everything failing at once is usually your uplink, DNS or the probe"
-    echo "  destination — not every node dying together. If you meant it:"
+    echo "  destination - not every node dying together. If you meant it:"
     echo "      ALIVE_MIN=0 $0 --prune"
     exit 2
   fi
@@ -321,7 +321,7 @@ fi
 
 echo
 # The dead count is measured. The alive count is not, unless the service is at
-# debug — at warning it logs failures and nothing else, so "alive" really means
+# debug - at warning it logs failures and nothing else, so "alive" really means
 # "never reported failing", and saying otherwise would be a claim we cannot back.
 printf '%s of %s outbounds failed in %s\n' "$n_failed" "$total" "$SINCE"
 if [[ $coverage == assumed ]]; then
@@ -329,5 +329,5 @@ if [[ $coverage == assumed ]]; then
     "$(( total - n_failed ))"
 else
   printf '%s answered%s\n' "$(grep -c . <<<"${alive:-}" || true)" \
-    "$( (( n_checked < total )) && echo ", but only $n_checked of $total were probed — widen ALIVE_SINCE" || true)"
+    "$( (( n_checked < total )) && echo ", but only $n_checked of $total were probed - widen ALIVE_SINCE" || true)"
 fi
