@@ -1,0 +1,919 @@
+#!/usr/bin/env python3
+"""sub2xray: build an Xray confdir from subscriptions.
+
+    python3 sub2xray.py init                          # once: inbounds + routing
+    python3 sub2xray.py pool --name de --size 20 sub.txt
+    curl -s "$SUBURL" | python3 sub2xray.py pool --name nl --size 20
+    xray run -confdir conf
+
+Two commands because they have different lifecycles. `init` writes the config
+you then hand-edit and rarely touch; `pool` rewrites node files every refresh.
+Conflating them is how a subscription refresh silently reverts your routing.
+
+This owns the secret-free half of the confdir. The wireguard inbound
+(05-wireguard.json) belongs to wg-peer.sh, because only it can generate the
+server key — Xray rejects an empty one, so there is no useful stub to write.
+
+Input may be a base64 subscription blob or a plain list of vless://, vmess://,
+trojan://, ss:// or hysteria2:// URIs. Anything else is counted and named on
+stderr, never
+dropped quietly — a subscription that silently halves is indistinguishable from
+one full of dead nodes.
+"""
+import argparse
+import base64
+import io
+import glob
+import json
+import os
+import sys
+import uuid
+from urllib.parse import urlparse, parse_qs, unquote
+
+# Destinations that must not leave over the local uplink. Used by the
+# selective-mode routing rule and nowhere else: the DNS servers are DoH and
+# resolve everything, so this list no longer has to be repeated there too.
+DOMAIN_LIST = [
+    "domain:accounts.google.com",
+    "domain:golang.org",
+    "domain:bitbucket.org",
+    "domain:reddit.com",
+    "domain:gemini.google.com",
+    "domain:spotifycdn.com",
+    "domain:cloudfront.net",
+    "domain:spotify.com",
+    "domain:deezer.com",
+    "domain:asnet.pw",
+    "domain:bitru.org",
+    "domain:yourbittorrent.com",
+    "domain:torrentcore.xyz",
+    "domain:archive.org",
+    "domain:bitsearch.to",
+    "domain:docker.com",
+    "domain:ifconfig.co",
+    "domain:docker.io",
+    "domain:stremio.com",
+    "domain:strem.io",
+    "domain:telegram.com",
+    "domain:youtube.com",
+    "domain:googleapis.cn",
+    "domain:gstatic.com",
+    "domain:ytimg.com",
+    "domain:ggpht.com",
+    "domain:nextlgsdp.com",
+    "domain:mixtapetorrent.com",
+    "domain:lgsmartad.com",
+    "domain:lavaforge.org",
+    "domain:lscr.io",
+    "domain:ghcr.io",
+    "domain:githubusercontent.com",
+    "domain:thepiratebay.org",
+    "domain:apibay.org",
+    "domain:github.com",
+    "geosite:instagram",
+    "geosite:netflix",
+    "geosite:spotify",
+    "geosite:openai",
+    "geosite:google",
+    "geosite:meta",
+    "geosite:apple",
+    "geosite:reddit",
+    "geosite:twitch",
+    "geosite:youtube",
+    "geosite:telegram",
+    "geosite:category-porn",
+    "geosite:discord",
+]
+
+# The fwmark nftables returns on. EVERY socket xray opens to the outside has
+# to carry it: without it the OUTPUT chain marks the packet 1 and hands it
+# straight back to the tproxy inbound, and xray starts answering its own
+# upstream DNS queries out of its own cache. nftables also skips xray's uid
+# as a second line of defence, because a protocol that ignores sockopt (or a
+# hand-added outbound that forgets it) must not be able to reopen that loop.
+FWMARK = 2
+SOCKOPT = {"mark": FWMARK}
+
+
+TAG_PREFIX = "prox"      # the selector in ROUTING; kept in step below
+
+# One confdir, shared with wg-peer.sh via the same env var and the same default.
+# If these two ever disagree you get a config that looks fine and routes nothing,
+# so wg-peer refuses to seed unless it finds ROUTING beside it.
+CONFDIR = os.environ.get("XRAY_CONFDIR", "conf")   # ./conf, relative to cwd
+# Retirement lived here: a .retired deny-list of identities, retagged dead-* so
+# subjectSelector stopped matching them. Removed 2026-08-09. It was only needed
+# because the live config was generated straight from the subscription with no
+# quality gate — absence from a list was how a dead node was kept out. The
+# health check is that gate now, so a deny-list has no job beside it. See
+# alive.sh, which archives what it deletes.
+INBOUNDS = "00-inbounds.json"    # sub2xray init
+WIREGUARD = "05-wireguard.json"  # wg-peer — it holds the server key
+ROUTING = "10-routing.json"      # sub2xray init
+
+
+def b64d(s):
+    """Decode base64, tolerating missing padding and urlsafe alphabet."""
+    s = s.strip().replace("-", "+").replace("_", "/")
+    return base64.b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", "replace")
+
+
+def stream(net, security, sni, host, path, service, fp, pbk, sid):
+    """Shared streamSettings — identical between vless and vmess."""
+    ss = {"network": net, "security": security, "sockopt": dict(SOCKOPT)}
+    if net == "ws":
+        ss["wsSettings"] = {"path": path or "/", "headers": {"Host": host or sni}}
+    elif net == "grpc":
+        ss["grpcSettings"] = {"serviceName": service}
+    # tcp needs nothing extra
+    if security == "tls":
+        ss["tlsSettings"] = {"serverName": sni, "fingerprint": fp or "chrome"}
+    elif security == "reality":
+        ss["realitySettings"] = {
+            "serverName": sni, "fingerprint": fp or "chrome",
+            "publicKey": pbk, "shortId": sid,
+        }
+    return ss
+
+
+def parse_vless(uri, tag):
+    u = urlparse(uri)
+    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    sni = q.get("sni", u.hostname)
+    out = {
+        "tag": tag,
+        "protocol": "vless",
+        "settings": {"vnext": [{
+            "address": u.hostname, "port": u.port or 443,
+            "users": [{"id": u.username, "encryption": q.get("encryption", "none"),
+                       "flow": q.get("flow", "")}],
+        }]},
+        "streamSettings": stream(
+            q.get("type", "tcp"), q.get("security", "none"), sni,
+            q.get("host", ""), unquote(q.get("path", "/")),
+            q.get("serviceName", ""), q.get("fp", ""),
+            q.get("pbk", ""), q.get("sid", "")),
+    }
+    return out
+
+
+def parse_trojan(uri, tag):
+    u = urlparse(uri)
+    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    sni = q.get("sni", u.hostname)
+    out = {
+        "tag": tag,
+        "protocol": "trojan",
+        "settings": {"servers": [{
+            "address": u.hostname, "port": u.port or 443,
+            "password": unquote(u.username or ""),
+        }]},
+        "streamSettings": stream(
+            q.get("type", "tcp"), q.get("security", "tls"), sni,
+            q.get("host", ""), unquote(q.get("path", "/")),
+            q.get("serviceName", ""), q.get("fp", ""),
+            q.get("pbk", ""), q.get("sid", "")),
+    }
+    return out
+
+
+def parse_vmess(uri, tag):
+    c = json.loads(b64d(uri[len("vmess://"):]))
+    sni = c.get("sni") or c.get("host") or c.get("add")
+    net = c.get("net", "tcp")
+    security = "tls" if str(c.get("tls", "")) in ("tls", "true", "1") else "none"
+    out = {
+        "tag": tag,
+        "protocol": "vmess",
+        "settings": {"vnext": [{
+            "address": c["add"], "port": int(c["port"]),
+            "users": [{"id": c["id"], "alterId": int(c.get("aid", 0)),
+                       "security": c.get("scy", "auto")}],
+        }]},
+        "streamSettings": stream(
+            net, security, sni, c.get("host", ""), c.get("path", "/"),
+            c.get("path", "") if net == "grpc" else "", c.get("fp", ""), "", ""),
+    }
+    return out
+
+
+# What xray-core's shadowsocks outbound will actually accept. The legacy stream
+# ciphers (aes-256-cfb, rc4-md5, ...) were removed upstream, so a node using one
+# is unusable here however well it parses — refuse it by name rather than let
+# xray fail the whole config later with "not a valid cipher".
+SS_METHODS = {
+    "aes-128-gcm", "aes-256-gcm", "chacha20-poly1305", "chacha20-ietf-poly1305",
+    "xchacha20-poly1305", "xchacha20-ietf-poly1305", "none", "plain",
+    "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
+    "2022-blake3-chacha20-poly1305",
+}
+
+
+def parse_ss(uri, tag):
+    """ss:// in both shapes that appear in the wild.
+
+    SIP002  ss://<b64url(method:password)>@host:port?...#name
+            ss://method:password@host:port#name        (2022 ciphers, plain)
+    legacy  ss://<b64(method:password@host:port)>#name
+
+    The two are told apart by where the '@' is: in SIP002 it is in the URI, in
+    the legacy form it is inside the base64. Anything with ?plugin= is refused —
+    v2ray-plugin and friends are separate processes that xray cannot host.
+    """
+    body = uri[len("ss://"):]
+    body = body.split("#", 1)[0]
+    body, _, query = body.partition("?")
+    if "plugin" in parse_qs(query):
+        raise ValueError("ss plugin= is not supported by xray-core")
+    if "@" in body:
+        userinfo, hostport = body.rsplit("@", 1)
+        if ":" not in userinfo:              # SIP002 encodes only the userinfo
+            userinfo = b64d(userinfo)
+    else:                                    # legacy: the whole body is base64
+        userinfo, _, hostport = b64d(body).rpartition("@")
+    method, _, password = userinfo.partition(":")
+    host, _, port = hostport.rpartition(":")
+    method = method.strip().lower()
+    if method not in SS_METHODS:
+        raise ValueError(f"ss method {method!r} is not in xray-core")
+    if not host or not port.isdigit():
+        raise ValueError(f"ss address {hostport!r} is not host:port")
+    return {
+        "tag": tag,
+        "protocol": "shadowsocks",
+        "settings": {"servers": [{
+            "address": host.strip("[]"),     # IPv6 arrives bracketed; xray wants it bare
+            "port": int(port), "method": method, "password": password,
+        }]},
+        # sockopt ONLY. Plain shadowsocks is raw TCP: network and security are
+        # left unset so xray keeps its defaults (raw/none) — naming a security
+        # here would make it negotiate TLS and every ss node would fail. But the
+        # block cannot be omitted altogether, which is what it used to be: with
+        # no streamSettings there is no fwmark, so every ss dial was caught by
+        # the tproxy inbound and dispatched a second time. Most public pools are
+        # majority shadowsocks, so that was most of the pool looping.
+        "streamSettings": {"sockopt": dict(SOCKOPT)},
+    }
+
+
+def parse_hysteria2(uri, tag):
+    """hysteria2://password@host:port?sni=…&insecure=…#name
+
+    Xray 26.3.27 registers this as protocol "hysteria" with version 2 — there
+    is no "hysteria2" config id, which is why it read as unsupported until the
+    dev's own binary was checked. Settings are flat: address, port, password.
+
+    ⚠ Validate before emitting. A hysteria outbound with a missing address does
+    not fail -test, it PANICS xray on load — so one malformed subscription entry
+    would take the service down rather than being rejected. Verified against
+    26.3.27.
+    """
+    u = urlparse(uri)
+    host, port = u.hostname, u.port or 443
+    if not host:
+        raise ValueError("hysteria2 without a host would panic xray on load")
+    if not 0 < port < 65536:
+        raise ValueError(f"hysteria2 port {port} out of range")
+    return {
+        "tag": tag,
+        "protocol": "hysteria",
+        "settings": {"version": 2, "address": host, "port": port,
+                     "password": unquote(u.username or "")},
+        # Same reason as shadowsocks: no streamSettings meant no fwmark.
+        # streamSettings is parsed by the generic StreamConfig for every
+        # protocol before the transport ever sees it, so naming sockopt here
+        # cannot fail to load whatever hysteria does with it afterwards.
+        # ⚠ Whether its QUIC dialer HONOURS the mark is not something this repo
+        # verifies — it opens its own socket. That is why nftables also skips
+        # xray's uid: the mark is the belt, the uid rule is the braces, and for
+        # a protocol like this one only the braces are load-bearing.
+        "streamSettings": {"sockopt": dict(SOCKOPT)},
+    }
+
+
+def parse(uri, tag):
+    if uri.startswith("vless://"):
+        return parse_vless(uri, tag)
+    if uri.startswith("vmess://"):
+        return parse_vmess(uri, tag)
+    if uri.startswith("trojan://"):
+        return parse_trojan(uri, tag)
+    if uri.startswith("ss://"):
+        return parse_ss(uri, tag)
+    if uri.startswith(("hysteria2://", "hy2://")):
+        return parse_hysteria2(uri, tag)
+    if uri.startswith(("hysteria://", "hy://")):
+        # Not "unsupported": xray HAS a hysteria outbound, it just refuses
+        # anything but version 2 — "version != 2". v1 is dead upstream anyway.
+        raise ValueError("hysteria v1: xray's hysteria outbound only speaks version 2")
+    return None  # anything else: no such outbound in xray-core
+
+
+def _where(uri):
+    """host:port for a skip message, without trusting the URI to be parseable."""
+    try:
+        u = urlparse(uri)
+        if u.hostname:
+            return f"{u.hostname}:{u.port or '?'}"
+    except ValueError:
+        pass
+    return uri[:48]
+
+
+def build(raw, pool):
+    """One pool file: outbounds only, all tagged <TAG_PREFIX>-<pool>-<n>.
+
+    The pool name is in every tag because -confdir merges files by tag, and a
+    tag appearing in two files is *silently overwritten* — no error, one node
+    quietly gone. The namespace is what makes pool files independent.
+    """
+    # Input is either base64 of the URI list, or the URIs already.
+    text = raw if "://" in raw else b64d(raw)
+    outbounds, skipped = [], {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        scheme = line.split("://", 1)[0] if "://" in line else "(not a URI)"
+        try:
+            ob = parse(line, "")
+        except Exception as e:            # one bad node must not kill the batch
+            skipped.setdefault(scheme, []).append(f"{_where(line)} — {e}")
+            continue
+        if ob:
+            ob["tag"] = f"{TAG_PREFIX}-{pool}-{len(outbounds) + 1}"
+            outbounds.append(ob)
+        else:
+            skipped.setdefault(scheme, []).append(
+                f"{_where(line)} — no {scheme} outbound exists in xray-core")
+    # Counted AND named. A subscription that quietly halves looks exactly like
+    # one full of dead nodes, and the alive-count would then be measured against
+    # a pool that lost members without saying so.
+    for scheme, why in sorted(skipped.items()):
+        print(f"skipped {len(why)} {scheme} node(s):", file=sys.stderr)
+        for w in why:
+            print(f"  {w}", file=sys.stderr)
+    if not outbounds:
+        sys.exit("no vless/vmess/trojan/ss nodes found in input")
+    return {"outbounds": outbounds}
+
+
+def node_id(ob):
+    """Identity that survives a subscription refetch: where it goes, and as whom.
+
+    Tags cannot be used for this — they are positional, so one node appearing or
+    disappearing upstream renumbers everything after it.
+    """
+    st = ob["settings"]
+    if "vnext" in st:                     # vless, vmess
+        v = st["vnext"][0]
+        secret = v["users"][0].get("id", "")
+    elif "servers" in st:                 # trojan, shadowsocks
+        v = st["servers"][0]
+        secret = v.get("password", "")
+    else:                                 # hysteria: settings are flat
+        v = st
+        secret = st.get("password", "")
+    return f"{v['address']}:{v['port']}:{secret}"
+
+
+def inbounds_conf(tproxy_port, proxy_listen, proxy_port, vless, loglevel):
+    """The tproxy door, plus an ordinary proxy port for things that ask for one.
+
+    `all-in` is the transparent one: nftables tproxies every captured packet at
+    it, so it sees the real destination address rather than a CONNECT request.
+    `local_proxy` is for callers that cannot be captured — a container on a
+    bridge the ruleset does not cover, or an app you would rather point at a
+    proxy explicitly.
+
+    Sniffing is on so routing rules can match domains; without it a rule sees
+    only the IP, and every domain rule in 10-routing.json is dead weight.
+
+    ⚠ Logging goes to stdout, NOT to /var/log/xray/*.log. Under systemd stdout
+    is journald, which is where alive.sh reads the observatory's verdicts from.
+    Point `log.access`/`log.error` at files and journalctl goes quiet, so
+    alive.sh reports a pool where nothing ever failed — the one state it warns
+    about because it is indistinguishable from a broken grep.
+    """
+    sniff = {"destOverride": ["http", "tls"], "enabled": True, "routeOnly": False}
+    inbounds = [
+        {
+            "tag": "all-in",
+            "port": tproxy_port,
+            "protocol": "dokodemo-door",
+            "settings": {"followRedirect": True, "network": "tcp,udp"},
+            "sniffing": sniff,
+            "streamSettings": {"sockopt": {"tproxy": "tproxy"}},
+        },
+        {
+            "tag": "local_proxy",
+            "listen": proxy_listen,
+            "port": proxy_port,
+            "protocol": "mixed",          # socks and http on one port
+            "settings": {"allowTransparent": False, "auth": "noauth", "udp": True},
+            "sniffing": sniff,
+        },
+    ]
+    if vless:
+        # Opt-in, and the uuid is generated rather than shipped. A literal one
+        # in a config template is a credential everybody who cloned the repo
+        # shares, and this inbound is reachable from the network by definition.
+        listen, _, port = vless.rpartition(":")
+        inbounds.append({
+            "tag": "inbound-external",
+            "listen": listen or "0.0.0.0",
+            "port": int(port),
+            "protocol": "vless",
+            "settings": {
+                "clients": [{"id": str(uuid.uuid4()), "email": "peer", "flow": ""}],
+                "decryption": "none",
+            },
+            "sniffing": sniff,
+            "streamSettings": {"network": "tcp", "security": "none"},
+        })
+    return {"log": {"loglevel": loglevel}, "inbounds": inbounds}
+
+
+def dns_conf(mode):
+    """Split DNS: the proxied set resolves at the exit node, the rest resolves here.
+
+    A DNS server's `tag` becomes the INBOUND tag of the queries that server
+    emits, and that is the whole mechanism — it is how a routing rule gets to
+    say where a lookup travels, as opposed to where it is sent:
+
+      dns-proxied  → the balancer.
+      dns-direct   → direct.
+
+    In selective mode the proxied server is scoped to DOMAIN_LIST, so the same
+    list decides what is proxied and where its names are resolved; the two
+    cannot drift. In full mode it is unscoped, because everything is proxied.
+
+    ⚠ The rules that read these tags need `"type": "field"`. Without it the rule
+    is not a field rule and never matches, which is a silent no-op: the tag
+    looks wired up and the queries go out the catch-all.
+
+    Resolving at the exit is not only about poisoning. It is where the answer
+    should come from: resolve a CDN name here and you get the IP that is optimal
+    for *here*, then reach it down a tunnel that surfaces somewhere else.
+
+    ⚠ DoH on BOTH, and that is what makes the fallback safe rather than a hole.
+    If the proxied lookup cannot complete — the window after a restart, before
+    the observatory has probed anyone and while fallbackTag is blackholing —
+    xray falls through to the next server. Falling through to a plaintext
+    resolver is how a censored name gets a forged answer that is then CACHED,
+    and afterwards even a working node dials 10.10.34.36. Falling through to
+    another DoH server costs a geographically wrong answer and nothing else, so
+    the fallback is left ON: refusing to resolve at all would deadlock the pool
+    it is waiting for.
+
+    ⚠ Never udp:// or tcp://. On a network that injects answers a plain resolver
+    is not a resolver, and "use a public one" is not the fix — 8.8.4.4 returned
+    the block address too, because the injection happens in transit rather than
+    at the server. Over HTTPS a forged answer fails the certificate check. tcp://
+    has a second problem: the stream is framed by a 2-byte length prefix, so
+    anything answering port 53 with something else corrupts it beyond recovery —
+    an HTTP reply reads as an 18516-byte message ('H','T').
+
+    queryStrategy UseIPv4 because every name was otherwise asked twice and the
+    AAAA half came back empty, then got retried against every server in turn.
+    """
+    proxied = {"address": "https://1.1.1.1/dns-query", "tag": "dns-proxied"}
+    if mode == "selective":
+        proxied["domains"] = DOMAIN_LIST
+    return {
+        "queryStrategy": "UseIPv4",
+        "servers": [proxied, {"address": "https://8.8.8.8/dns-query",
+                              "tag": "dns-direct"}],
+    }
+
+
+def routing_conf(probe_interval, mode):
+    """The one observatory. Xray allows exactly one, and it cannot be nested.
+
+    burstObservatory, not the plain one. The plain observatory sleeps
+    probeInterval *between each outbound*, so its interval is a per-node delay
+    rather than a round period: measured at 4 of 50 nodes reached in 40s at
+    10s, which at 3m over 200 nodes is a ~10 hour round. burst probes
+    concurrently, so interval means what it looks like it means.
+
+    Declare only one of the two. Both present and leastLoad silently degrades.
+
+    mode="full"       everything exits through the pool; direct is the exception.
+    mode="selective"  DOMAIN_LIST exits through the pool; direct is the default.
+
+    These were the two config*.json.example files in the tproxy repo. They are
+    one flag now, because they only ever differed in the last few rules and
+    keeping two whole configs in step by hand is how one of them rots.
+    """
+    proxy_rules = (
+        [{"type": "field", "network": "tcp,udp", "balancerTag": "lb"}]
+        if mode == "full" else
+        [
+            {"type": "field", "ip": ["geoip:telegram"], "balancerTag": "lb"},
+            {"type": "field", "domain": DOMAIN_LIST, "balancerTag": "lb"},
+            {"type": "field", "network": "tcp,udp", "outboundTag": "direct"},
+        ]
+    )
+    return {
+        "dns": dns_conf(mode),
+        "outbounds": [
+            # Every one of these carries the fwmark. `direct` without it is an
+            # instant loop: the packet leaves, the OUTPUT chain marks it 1, and
+            # the ip rule sends it back to the tproxy inbound that emitted it.
+            {"tag": "direct", "protocol": "freedom",
+             "settings": {"domainStrategy": "UseIPv4"},
+             "streamSettings": {"sockopt": dict(SOCKOPT)}},
+            {"tag": "block", "protocol": "blackhole",
+             "settings": {"response": {"type": "http"}}},
+            # No `settings.address`: with one, this outbound answers A/AAAA out
+            # of the DNS module and forwards the rest to that address. The
+            # module's own upstream queries are what we are trying to keep away
+            # from here, so it is left to hand every query back to the module
+            # and let the dns-proxied/dns-direct rules decide how it travels.
+            {"tag": "dns-out", "protocol": "dns",
+             "streamSettings": {"sockopt": dict(SOCKOPT)}},
+        ],
+        "burstObservatory": {
+            "subjectSelector": [TAG_PREFIX],
+            "pingConfig": {
+                "destination": "https://www.gstatic.com/generate_204",
+                "interval": probe_interval,
+                # window, not rate: probe rate stays nodes/interval either way.
+                # 3 samples ride out one unlucky timeout without going dead.
+                "sampling": 3,
+                "timeout": "5s",
+            },
+        },
+        "routing": {
+            # fallbackTag fires when the strategy can pick nobody — notably the
+            # window after a restart, before the first probe round lands. Without
+            # it, balancerTag rules fall through and every connection piles onto
+            # the FIRST outbound, whichever node that happens to be. Blackholing
+            # instead fails fast and visibly rather than timing out against one
+            # arbitrary node for a minute. It is also why dns-direct exists.
+            "balancers": [{"tag": "lb", "selector": [TAG_PREFIX],
+                           "fallbackTag": "block",
+                           "strategy": {"type": "leastPing"}}],
+            # AsIs, not IPIfNonMatch. Under tproxy the destination IP is already
+            # on the packet, so ip/geoip rules match without help; IPIfNonMatch
+            # only adds a forward lookup per connection whose answer then gets a
+            # vote on where the connection goes.
+            "domainStrategy": "AsIs",
+            # Order matters and is why these live in one file: first match wins.
+            "rules": [
+                # FIRST, and they must stay first: traffic the DNS module itself
+                # emits. Below the port-53 rule a resolver's own query matches
+                # that rule and is handed back to dns-out — the module then
+                # answers its own upstream lookups out of its own cache, which
+                # reads in the log as an endless "cache HIT ... empty response".
+                {"type": "field", "inboundTag": ["dns-proxied"], "balancerTag": "lb"},
+                {"type": "field", "inboundTag": ["dns-direct"], "outboundTag": "direct"},
+                # client DNS, intercepted and re-asked by the module. udp only:
+                # matching tcp/53 here would loop for the same reason.
+                {"type": "field", "network": "udp", "port": "53",
+                 "outboundTag": "dns-out"},
+                # The LAN, the host and the docker bridges. nftables returns on
+                # these too, but a packet that arrives some other way (the mixed
+                # inbound, a container pointed at it explicitly) never touches
+                # that ruleset.
+                {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+                # Torrents stay off the pool. They are free public nodes shared
+                # by strangers; a swarm opens hundreds of connections a second
+                # and would be both useless over them and abusive to them.
+                # Needs the sniffer, which is why sniffing is on.
+                {"type": "field", "protocol": ["bittorrent"], "outboundTag": "direct"},
+                {"type": "field", "domain": ["geosite:category-ads-all"],
+                 "outboundTag": "block"},
+                # QUIC has no way through these proxies; blocking it makes
+                # browsers fall back to TCP TLS, which they can carry. It has to
+                # sit above the proxy rules — below them, the proxied domains
+                # are exactly the QUIC-heavy ones and their udp/443 would be
+                # handed to a balancer that cannot carry it.
+                {"type": "field", "network": "udp", "port": "443",
+                 "outboundTag": "block"},
+            ] + proxy_rules,
+        },
+    }
+
+
+def write_json(path, obj):
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+        f.write("\n")
+    print(f"wrote {path}", file=sys.stderr)
+
+
+def write_pool(outdir, pool, outbounds, size):
+    """One file per chunk of `size` nodes; 0 means a single file.
+
+    Existing files for this pool are removed first: a subscription that shrank
+    would otherwise leave stale chunks behind, and -confdir would merge those
+    dead nodes back in with no warning.
+    """
+    for stale in glob.glob(os.path.join(outdir, f"50-pool-{pool}-*.json")):
+        os.remove(stale)
+    step = size if size > 0 else len(outbounds)
+    chunks = [outbounds[i:i + step] for i in range(0, len(outbounds), step)]
+    for n, chunk in enumerate(chunks, 1):
+        # zero-padded: -confdir reads in name order, where "10" sorts before "2"
+        write_json(os.path.join(outdir, f"50-pool-{pool}-{n:02d}.json"),
+                   {"outbounds": chunk})
+    return len(chunks)
+
+
+def write_scaffold(outdir, probe_interval, mode, inbound, force):
+    """Create the hand-editable files, but never clobber edits by default."""
+    for name, conf in ((INBOUNDS, inbounds_conf(**inbound)),
+                       (ROUTING, routing_conf(probe_interval, mode))):
+        path = os.path.join(outdir, name)
+        if os.path.exists(path) and not force:
+            print(f"kept   {path} (--force to rewrite)", file=sys.stderr)
+        else:
+            write_json(path, conf)
+
+
+def _selftest():
+    v = parse("vless://uid@ex.com:443?type=ws&security=tls&sni=h.com&host=h.com&path=%2Fp&fp=chrome#n", "prox-1")
+    assert v["settings"]["vnext"][0]["address"] == "ex.com"
+    assert v["settings"]["vnext"][0]["users"][0]["id"] == "uid"
+    assert v["streamSettings"]["wsSettings"]["path"] == "/p"
+    assert v["streamSettings"]["wsSettings"]["headers"]["Host"] == "h.com"
+    assert v["streamSettings"]["tlsSettings"]["serverName"] == "h.com"
+    raw = "eyJhZGQiOiJleC5jb20iLCJwb3J0IjoiNDQzIiwiaWQiOiJ1aWQiLCJhaWQiOiIwIiwibmV0Ijoid3MiLCJob3N0IjoiaC5jb20iLCJwYXRoIjoiLyIsInRscyI6InRscyJ9"
+    m = parse("vmess://" + raw, "prox-2")
+    assert m["settings"]["vnext"][0]["address"] == "ex.com"
+    assert m["streamSettings"]["security"] == "tls"
+    t = parse("trojan://p%40ss@ex.com:443?type=ws&security=tls&sni=h.com&path=%2Fp#n", "prox-3")
+    assert t["protocol"] == "trojan"
+    assert t["settings"]["servers"][0]["password"] == "p@ss"
+    assert t["settings"]["servers"][0]["address"] == "ex.com"
+    assert t["streamSettings"]["wsSettings"]["path"] == "/p"
+
+    # ss:// in all three shapes. SIP002 base64 userinfo, SIP002 plain (what the
+    # 2022 ciphers use), and the legacy all-in-one-blob form.
+    sip = "ss://" + base64.b64encode(b"aes-256-gcm:sspw").decode() + "@s.com:8388#n"
+    for u in (sip,
+              "ss://2022-blake3-aes-256-gcm:sspw@s.com:8388#n",
+              "ss://" + base64.b64encode(b"aes-256-gcm:sspw@s.com:8388").decode() + "#n"):
+        o = parse(u, "prox-s")
+        assert o["protocol"] == "shadowsocks", u
+        srv = o["settings"]["servers"][0]
+        assert (srv["address"], srv["port"], srv["password"]) == ("s.com", 8388, "sspw"), u
+        # sockopt and NOTHING else. Naming a security here would make xray
+        # negotiate TLS and every ss node would fail — but omitting the block
+        # altogether is what left ss dials unmarked and looping through tproxy.
+        assert o["streamSettings"] == {"sockopt": {"mark": FWMARK}}, u
+        assert "security" not in o["streamSettings"], u
+    assert parse(sip, "t")["settings"]["servers"][0]["method"] == "aes-256-gcm"
+    # node_id must key on ss the same way it keys on vless, or nothing downstream
+    # can identify one — it reads servers[0] rather than vnext[0]
+    assert node_id(parse(sip, "t")) == "s.com:8388:sspw"
+    # ...and on hysteria, whose settings are flat rather than a servers[] list
+    assert node_id(parse("hysteria2://hpw@h.example:8443", "t")) == "h.example:8443:hpw"
+
+    # refused, loudly, rather than handed to xray to fail on later
+    for bad, why in (("ss://" + base64.b64encode(b"aes-256-cfb:p").decode() + "@s.com:8388", "method"),
+                     ("ss://" + base64.b64encode(b"aes-256-gcm:p").decode() + "@s.com:8388?plugin=v2ray-plugin", "plugin")):
+        try:
+            parse(bad, "t"); assert False, f"{why} should have been refused"
+        except ValueError:
+            pass
+
+    # hysteria2, which xray registers as protocol "hysteria" with version 2 —
+    # there is no "hysteria2" config id. Flat settings, confirmed against 26.3.27.
+    h = parse("hysteria2://p%40ss@h.example:8443?sni=a.b&insecure=1#Oslo", "prox-h")
+    assert h["protocol"] == "hysteria"
+    assert h["settings"] == {"version": 2, "address": "h.example", "port": 8443,
+                             "password": "p@ss"}
+    assert "hy2://" and parse("hy2://pw@h.example:443", "t")["protocol"] == "hysteria"
+    # ⚠ A hysteria outbound with no address PANICS xray on load rather than
+    # failing -test, so one malformed entry would take the service down. Refuse
+    # it here or nothing downstream gets the chance.
+    for bad in ("hysteria2://pw@:443", "hysteria://pw@h.example:443"):
+        try:
+            parse(bad, "t"); assert False, f"{bad} should have been refused"
+        except ValueError:
+            pass
+
+    uris = "\n".join([
+        "vless://u1@a.com:443?security=reality&pbk=k&sid=1#Berlin",
+        "vless://u2@b.com:443?security=reality&pbk=k&sid=2#Munich",
+        "trojan://p@c.com:443?security=tls#Amsterdam",
+        "ss://" + base64.b64encode(b"aes-256-gcm:sspw").decode() + "@d.com:8388#Oslo",
+        "hysteria2://hpw@e.com:443#Reykjavik",
+        "hysteria://old@f.com:443#v1-unsupported",
+    ])
+    # curl returns base64, often line-wrapped; the padding math must survive newlines
+    blob = base64.b64encode(uris.encode()).decode()
+    assert b64d("\n".join(blob[i:i + 70] for i in range(0, len(blob), 70))) == uris
+    assert build(blob, "de")["outbounds"] == build(uris, "de")["outbounds"]
+
+    # The skip must be VISIBLE. A subscription that quietly halves is
+    # indistinguishable from one full of dead nodes, and the alive-count would
+    # then be measured against a pool that lost members without saying so.
+    buf, old = io.StringIO(), sys.stderr
+    sys.stderr = buf
+    try:
+        build(uris, "de")
+    finally:
+        sys.stderr = old
+    noise = buf.getvalue()
+    assert "skipped 1 hysteria node(s)" in noise, noise
+    assert "f.com:443" in noise, noise          # named, not just counted
+    assert "only speaks version 2" in noise, noise
+
+    a, b = build(uris, "de"), build(uris, "nl")
+    # pool file carries outbounds and nothing else
+    assert list(a) == ["outbounds"]
+    assert [o["tag"] for o in a["outbounds"]] == ["prox-de-1", "prox-de-2", "prox-de-3",
+                                                  "prox-de-4", "prox-de-5"]
+    # every tag is reachable by the single selector in 10-routing.json
+    assert all(o["tag"].startswith(TAG_PREFIX) for o in a["outbounds"])
+    # two pools must never collide: -confdir silently overwrites a duplicate tag
+    assert not ({o["tag"] for o in a["outbounds"]} & {o["tag"] for o in b["outbounds"]})
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        nodes = [{"tag": f"prox-x-{i}"} for i in range(1, 8)]
+        assert write_pool(d, "x", nodes, 3) == 3          # 7 nodes, size 3 -> 3 files
+        names = sorted(os.path.basename(p) for p in glob.glob(f"{d}/50-pool-x-*.json"))
+        assert names == ["50-pool-x-01.json", "50-pool-x-02.json", "50-pool-x-03.json"]
+        assert len(json.load(open(f"{d}/50-pool-x-03.json"))["outbounds"]) == 1
+        assert write_pool(d, "x", nodes, 0) == 1          # 0 means one file
+        # the shrink must not leave 02/03 behind for -confdir to merge back in
+        assert glob.glob(f"{d}/50-pool-x-*.json") == [f"{d}/50-pool-x-01.json"]
+
+        inb = {"tproxy_port": 12345, "proxy_listen": "127.0.0.1",
+               "proxy_port": 2080, "vless": "", "loglevel": "warning"}
+        write_scaffold(d, "3m", "selective", inb, False)
+        edited = json.load(open(f"{d}/10-routing.json"))
+        edited["routing"]["rules"].insert(0, {"type": "field", "domain": ["mine"]})
+        write_json(f"{d}/10-routing.json", edited)
+        write_scaffold(d, "3m", "selective", inb, False)  # refresh must not clobber
+        assert json.load(open(f"{d}/10-routing.json")) == edited
+        write_scaffold(d, "3m", "selective", inb, True)   # --force must
+        assert json.load(open(f"{d}/10-routing.json")) == routing_conf("3m", "selective")
+
+        # The confdir must carry no identity from whoever generated it. A LAN
+        # address and a literal uuid were baked in here once; the uuid is a
+        # credential every clone would then share, on an inbound that is
+        # reachable from the network by definition.
+        inb_json = json.load(open(f"{d}/00-inbounds.json"))
+        assert "inbound-external" not in [i["tag"] for i in inb_json["inbounds"]]
+        blob = json.dumps(inb_json)
+        assert "192.168.1." not in blob and "fb78e7cd" not in blob, blob
+        # ...and logging must stay on stdout, or journald has nothing and
+        # alive.sh reads an empty window as "nothing ever failed".
+        assert "access" not in inb_json["log"] and "error" not in inb_json["log"]
+        vl = inbounds_conf(12345, "127.0.0.1", 2080, "10.0.0.1:8585", "warning")
+        ext = [i for i in vl["inbounds"] if i["tag"] == "inbound-external"][0]
+        assert ext["listen"] == "10.0.0.1" and ext["port"] == 8585
+        u1 = ext["settings"]["clients"][0]["id"]
+        u2 = (inbounds_conf(12345, "127.0.0.1", 2080, "10.0.0.1:8585", "warning")
+              ["inbounds"][-1]["settings"]["clients"][0]["id"])
+        assert u1 != u2, "the vless uuid must be generated, not a constant"
+
+    # node_id outlives retirement: alive.sh keys its archive on identity, and the
+    # promote step must dedup on it — a tag in two files is silently overwritten
+    nodes = build(uris, "de")["outbounds"]
+    ids = [node_id(o) for o in nodes]
+    assert len(set(ids)) == len(ids)
+    # identity is stable when the node's position moves
+    shifted = build("\n".join(uris.splitlines()[::-1]), "de")["outbounds"]
+    assert {node_id(o) for o in shifted} == set(ids)
+
+    r = routing_conf("3m", "selective")
+    # burst only: the plain observatory's interval is a per-node sleep, and
+    # declaring both silently degrades the balancer
+    assert "observatory" not in r and "burstObservatory" in r
+    assert r["burstObservatory"]["pingConfig"]["interval"] == "3m"
+    # the selector must reach the tags build() emits, or nothing is ever probed
+    assert r["burstObservatory"]["subjectSelector"] == [TAG_PREFIX]
+    assert r["routing"]["balancers"][0]["selector"] == [TAG_PREFIX]
+    assert build(uris, "de")["outbounds"][0]["tag"].startswith(TAG_PREFIX)
+
+    # ---- the loop guards -------------------------------------------------
+    # EVERY outbound that dials out carries the fwmark. One that does not is
+    # caught by the nftables OUTPUT chain, marked 1 and handed back to the
+    # tproxy inbound that emitted it. This is the single assertion that would
+    # have caught the shadowsocks case, so it is written over the whole pool
+    # rather than per protocol.
+    for ob in build(uris, "de")["outbounds"]:
+        got = ob.get("streamSettings", {}).get("sockopt", {}).get("mark")
+        assert got == FWMARK, f"{ob['tag']} ({ob['protocol']}) has no fwmark: {got}"
+    for ob in r["outbounds"]:
+        if ob["protocol"] == "blackhole":
+            continue                      # answers locally, never opens a socket
+        got = ob.get("streamSettings", {}).get("sockopt", {}).get("mark")
+        assert got == FWMARK, f"{ob['tag']} has no fwmark: {got}"
+
+    rules = r["routing"]["rules"]
+    # A rule without type:field silently never matches. That is how the
+    # dnsproxy rule read as wired up while the queries went out the catch-all.
+    for rule in rules:
+        assert rule.get("type") == "field", rule
+    # Every tag a rule points at has to exist, in one direction or the other.
+    tags = {o["tag"] for o in r["outbounds"]} | {"lb"}
+    dns_tags = {srv["tag"] for srv in r["dns"]["servers"]}
+    for rule in rules:
+        assert rule.get("outboundTag", rule.get("balancerTag")) in tags, rule
+        for t in rule.get("inboundTag", []):
+            assert t in dns_tags, f"rule points at inbound tag {t!r} that no DNS server emits"
+    # The DNS module's own queries must be routed BEFORE the port-53 rule.
+    # Below it, a resolver's own lookup matches that rule and is handed back to
+    # dns-out, and the module starts answering its own upstream queries out of
+    # its own cache — the "cache HIT ... empty response" storm.
+    idx = {t: i for i, rule in enumerate(rules) for t in rule.get("inboundTag", [])}
+    port53 = next(i for i, rule in enumerate(rules) if rule.get("port") == "53")
+    assert idx["dns-proxied"] < port53 and idx["dns-direct"] < port53, rules
+    # ...and they must go different ways, or the split is not a split.
+    assert rules[idx["dns-proxied"]]["balancerTag"] == "lb"
+    assert rules[idx["dns-direct"]]["outboundTag"] == "direct"
+
+    # Split DNS mirrors the routing split: same list, both modes.
+    sel, full = routing_conf("3m", "selective"), routing_conf("3m", "full")
+    assert sel["dns"]["servers"][0]["domains"] == DOMAIN_LIST
+    assert "domains" not in full["dns"]["servers"][0]
+    assert [rr for rr in sel["routing"]["rules"]
+            if rr.get("domain") == DOMAIN_LIST][0]["balancerTag"] == "lb"
+    # Plaintext DNS cannot appear at all: an injected answer is believed and
+    # then cached, and afterwards even a working node dials the block address.
+    for conf in (sel, full):
+        for srv in conf["dns"]["servers"]:
+            assert srv["address"].startswith("https://"), srv
+        assert conf["dns"]["queryStrategy"] == "UseIPv4"
+    # The last rule is the catch-all, and it is the one thing the modes differ on.
+    assert sel["routing"]["rules"][-1]["outboundTag"] == "direct"
+    assert full["routing"]["rules"][-1]["balancerTag"] == "lb"
+    assert full["routing"]["rules"][-1]["network"] == "tcp,udp"
+    print("selftest ok")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--outdir", default=CONFDIR,
+                    help=f"confdir to write (default: {CONFDIR}, or $XRAY_CONFDIR)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_init = sub.add_parser("init", help="write inbounds + routing (once)")
+    p_init.add_argument("--mode", choices=("selective", "full"), default="selective",
+                        help="selective: only DOMAIN_LIST exits via the pool "
+                             "(default). full: everything does.")
+    p_init.add_argument("--probe-interval", default="3m",
+                        help="observatory interval; probe rate is nodes/interval")
+    p_init.add_argument("--tproxy-port", type=int, default=12345,
+                        help="dokodemo-door port nftables tproxies at (default: 12345)")
+    p_init.add_argument("--proxy-listen", default="127.0.0.1",
+                        help="listen address for the plain socks/http port. Use the "
+                             "docker bridge (172.17.0.1) to serve containers.")
+    p_init.add_argument("--proxy-port", type=int, default=2080)
+    p_init.add_argument("--vless-listen", default="", metavar="ADDR:PORT",
+                        help="also serve an inbound vless listener, e.g. "
+                             "192.168.1.10:8585. Off by default; the uuid is "
+                             "generated and printed, never shipped in the repo.")
+    p_init.add_argument("--loglevel", default="warning",
+                        choices=("debug", "info", "warning", "error", "none"),
+                        help="debug makes alive.sh able to confirm who answered")
+    p_init.add_argument("--force", action="store_true",
+                        help="rewrite the files, discarding your edits")
+
+    p_pool = sub.add_parser("pool", help="write node files for one subscription")
+    p_pool.add_argument("source", nargs="?", help="subscription file; omit for stdin")
+    p_pool.add_argument("--name", default="main", help="pool name, namespaces the tags")
+    p_pool.add_argument("--size", type=int, default=0, metavar="N",
+                        help="nodes per file; 0 (default) puts them all in one")
+
+    sub.add_parser("selftest", help="run the internal checks")
+    args = ap.parse_args()
+
+    if args.cmd == "selftest":
+        _selftest()
+    elif args.cmd == "init":
+        os.makedirs(args.outdir, exist_ok=True)
+        write_scaffold(args.outdir, args.probe_interval, args.mode,
+                       {"tproxy_port": args.tproxy_port,
+                        "proxy_listen": args.proxy_listen,
+                        "proxy_port": args.proxy_port,
+                        "vless": args.vless_listen,
+                        "loglevel": args.loglevel}, args.force)
+        if args.vless_listen:
+            path = os.path.join(args.outdir, INBOUNDS)
+            uid = [i for i in json.load(open(path))["inbounds"]
+                   if i["tag"] == "inbound-external"][0]["settings"]["clients"][0]["id"]
+            print(f"vless inbound uuid: {uid}", file=sys.stderr)
+        print(f"confdir ready at {args.outdir}/ — add nodes with: "
+              f"sub2xray.py pool --name <name> <sub>", file=sys.stderr)
+        print(f"wireguard peers go in {args.outdir}/{WIREGUARD} via wg-peer.sh",
+              file=sys.stderr)
+    else:
+        # Refuse rather than scaffold: silently creating routing here is exactly
+        # the conflation the two commands exist to prevent.
+        if not os.path.exists(os.path.join(args.outdir, ROUTING)):
+            sys.exit(f"{args.outdir}/{ROUTING} missing — run: sub2xray.py "
+                     f"--outdir {args.outdir} init")
+        src = open(args.source).read() if args.source else sys.stdin.read()
+        outbounds = build(src, args.name)["outbounds"]
+        n = write_pool(args.outdir, args.name, outbounds, args.size)
+        print(f"{len(outbounds)} nodes in pool '{args.name}' across {n} file(s)",
+              file=sys.stderr)
+

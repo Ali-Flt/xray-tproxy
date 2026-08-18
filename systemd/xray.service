@@ -1,0 +1,33 @@
+[Unit]
+Description=Xray Service
+Documentation=https://xtls.github.io/
+After=network.target nss-lookup.target
+
+[Service]
+User=xray
+# NET_ADMIN is not optional here: the dokodemo-door inbound sets IP_TRANSPARENT
+# and every outbound sets SO_MARK. Without it xray starts and then fails every
+# dial with "operation not permitted".
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# geosite:/geoip: rules are read from .dat files at startup, and a missing one
+# is a hard startup failure rather than a warning. Arch puts them here; Debian
+# and the official install script use /usr/local/share/xray.
+Environment=XRAY_LOCATION_ASSET=/usr/share/xray
+
+# Refuse to start on a config that does not parse, rather than dropping the
+# whole box off the network because one pool file got truncated mid-write.
+ExecStartPre=/usr/bin/xray -test -confdir /etc/xray/conf
+ExecStart=/usr/bin/xray run -confdir /etc/xray/conf
+
+# A pool is hundreds of outbounds and the observatory probes them concurrently;
+# the default 1024 is reached in the first probe round after a restart.
+LimitNOFILE=65536
+
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

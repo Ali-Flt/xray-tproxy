@@ -1,2 +1,7 @@
-*.json
-
+# Generated config: node credentials, and the wireguard server key.
+conf/
+# Subscription files and whatever they were fetched into. Same credentials,
+# one URI per node, and a sub link is usually an account.
+subs/
+__pycache__/
+alive-probe.log

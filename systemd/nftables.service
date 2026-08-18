@@ -1,0 +1,44 @@
+[Unit]
+Description=nftables ruleset and policy routing for the xray transparent proxy
+Documentation=man:nft(8) man:ip-rule(8)
+Wants=network-pre.target
+After=network-pre.target xray.service
+# Tied to xray: stopping or restarting xray takes the capture down with it,
+# so there is never a window where packets are tproxy'd at a port that has
+# nothing listening on it.
+PartOf=xray.service
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardInput=null
+ProtectSystem=full
+ProtectHome=true
+
+# ⚠ One ExecStart per command. systemd does not run these through a shell, so
+# the `a ; b` form this used to have passed ";" and the whole second command to
+# nft as arguments and the policy routing was never installed.
+
+# Idempotent: `add` fails if the rule is already there, which on a restart
+# would abort the unit; deleting first and ignoring the failure is stable.
+ExecStartPre=-/usr/sbin/ip rule del fwmark 1 table 100
+ExecStart=/usr/sbin/nft -f /etc/nftables.conf
+# `replace` rather than `add`, same reason.
+ExecStart=/usr/sbin/ip route replace local default dev lo table 100
+# This is what makes the output chain work: a locally generated packet cannot
+# be tproxy'd, so it is marked instead, and this rule sends anything marked 1
+# to a table whose local default route turns it back into prerouting.
+ExecStart=/usr/sbin/ip rule add fwmark 1 table 100
+
+ExecReload=/usr/sbin/nft -f /etc/nftables.conf
+
+# ⚠ `nft flush ruleset` used to be here. It wipes EVERY table in the system,
+# including whatever firewall you were relying on, and this unit only ever owns
+# one table. Delete that one.
+ExecStop=-/usr/sbin/nft delete table ip xray
+ExecStop=-/usr/sbin/ip rule del fwmark 1 table 100
+ExecStop=-/usr/sbin/ip route del local default dev lo table 100
+
+[Install]
+WantedBy=multi-user.target
