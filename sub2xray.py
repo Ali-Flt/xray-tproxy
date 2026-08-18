@@ -49,57 +49,30 @@ DOMAINS_HEADER = """\
 # the names that are resolved at the exit node rather than here. Edit, then
 # apply with:  sub2xray.py init --force
 #
+# The list below is a starting point. Add what you need; a geosite set is
+# usually a better answer than a page of hostnames, because it is maintained
+# upstream and follows the service when it moves.
+#
+# WARNING: an unknown geosite: name is a HARD startup failure, not a warning
+# like a mistyped prefix is. xray refuses to load the whole config and the
+# service will not come up. Check a new one with:
+#   xray -test -confdir <confdir>
+#
 """
 
 DEFAULT_DOMAINS = [
-    "domain:accounts.google.com",
-    "domain:golang.org",
-    "domain:bitbucket.org",
-    "domain:reddit.com",
-    "domain:gemini.google.com",
-    "domain:spotifycdn.com",
-    "domain:cloudfront.net",
-    "domain:spotify.com",
-    "domain:deezer.com",
-    "domain:asnet.pw",
-    "domain:bitru.org",
-    "domain:yourbittorrent.com",
-    "domain:torrentcore.xyz",
-    "domain:archive.org",
-    "domain:bitsearch.to",
-    "domain:docker.com",
-    "domain:ifconfig.co",
-    "domain:docker.io",
-    "domain:stremio.com",
-    "domain:strem.io",
-    "domain:telegram.com",
-    "domain:youtube.com",
-    "domain:googleapis.cn",
-    "domain:gstatic.com",
-    "domain:ytimg.com",
-    "domain:ggpht.com",
-    "domain:nextlgsdp.com",
-    "domain:mixtapetorrent.com",
-    "domain:lgsmartad.com",
-    "domain:lavaforge.org",
-    "domain:lscr.io",
-    "domain:ghcr.io",
-    "domain:githubusercontent.com",
-    "domain:thepiratebay.org",
-    "domain:apibay.org",
-    "domain:github.com",
-    "geosite:instagram",
+    # A starting point, not a curated list. Nine geosite sets rather than a
+    # hundred hand-listed hostnames: each one is maintained upstream in the
+    # geosite data and covers the domains that service actually uses today,
+    # including the ones it moves to next month.
+    "geosite:google",        # accounts, gstatic, googleapis, ggpht, gemini
+    "geosite:youtube",       # and ytimg
+    "geosite:telegram",
+    "geosite:meta",          # instagram, facebook, whatsapp
+    "geosite:openai",
     "geosite:netflix",
     "geosite:spotify",
-    "geosite:openai",
-    "geosite:google",
-    "geosite:meta",
-    "geosite:apple",
     "geosite:reddit",
-    "geosite:twitch",
-    "geosite:youtube",
-    "geosite:telegram",
-    "geosite:category-porn",
     "geosite:discord",
 ]
 
@@ -152,8 +125,9 @@ def read_domains(path):
     `#` starts a comment only at the start of a line or after whitespace, so a
     regexp: entry that contains one survives.
 
-    Deduping here rather than in the literal is why the shipped list stopped
-    carrying nextlgsdp.com twice: whatever you paste in, xray is handed it once.
+    Deduping here rather than at the point of definition is what makes pasting
+    safe: a list assembled by hand over time repeats itself, and whatever goes
+    in, xray is handed each matcher once.
     """
     out, seen = [], set()
     with open(path) as f:

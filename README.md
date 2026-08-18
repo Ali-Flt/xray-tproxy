@@ -126,11 +126,18 @@ regexp:^ex.*[.]com$   # a regular expression
 ```
 
 A `#` only starts a comment at the start of a line or after whitespace, so a `regexp:` entry containing one survives.
-Duplicates and surrounding whitespace are dropped, which is why the shipped list stopped carrying `nextlgsdp.com` twice.
+Duplicates and surrounding whitespace are dropped, which is what makes pasting into it safe.
 
-> An unknown prefix is not an error to xray.
+The seed is deliberately small: nine `geosite:` sets, not a page of hostnames.
+A geosite set is maintained upstream and follows the service when it changes domains, so it stays right without you.
+Add whatever else you need.
+
+> An unknown **prefix** is not an error to xray.
 > `geosit:netflix` is matched as the literal string `geosit:netflix`, which nothing is ever equal to.
 > A typo is therefore a rule that silently never fires, so the reader names the line and the prefix on stderr and carries on.
+>
+> An unknown **geosite name** is the opposite: `geosite:netflx` is a hard startup failure, xray refuses to load the config at all, and the service does not come up.
+> Check a new one with `xray -test -confdir <confdir>` before restarting.
 
 `--domains PATH` points somewhere else.
 An empty list is refused in `selective` mode, where it would leave the pool carrying nothing but `geoip:telegram`.
