@@ -51,7 +51,7 @@ Hysteria had the same hole.
 | `nftables.conf` | `/etc/xray/nftables.conf` |
 | `systemd/xray.service` | `/usr/lib/systemd/system/xray.service` |
 | `systemd/xray-nftables.service` | `/usr/lib/systemd/system/xray-nftables.service` |
-| `conf/*.json`, if present | `/etc/xray/conf/` |
+| `conf/*.json` and `conf/domains.txt`, if present | `/etc/xray/conf/` |
 
 Both are namespaced on purpose.
 A unit called `nftables.service` overwrites the one the distro's nftables package ships, and `/etc/nftables.conf` is that package's config file.
@@ -72,6 +72,7 @@ Run `sub2xray.py`, `alive.sh` and `wg-peer.sh` from the clone, with `XRAY_CONFDI
 | `05-wireguard.json` | `wg-peer` | the wireguard inbound: server key + peers |
 | `10-routing.json` | `sub2xray init` | dns, outbounds, observatory, the `lb` balancer, the rules |
 | `50-pool-<name>-NN.json` | `sub2xray pool` | outbounds for one subscription, chunked |
+| `domains.txt` | **you** | which destinations are proxied, one matcher per line |
 
 All inside `$XRAY_CONFDIR`, default `conf` in the current directory, `/etc/xray/conf` once installed.
 `sub2xray --outdir` and `wg-peer`'s `XRAY_CONF` override individually.
@@ -98,8 +99,9 @@ They only ever differed in the last few routing rules, and keeping two whole con
 | `selective` (default) | `direct` | `DOMAIN_LIST` and `geoip:telegram` |
 | `full` | the `lb` balancer | everything |
 
-Edit `DOMAIN_LIST` at the top of `sub2xray.py` and re-run `init --force`.
+Edit `$XRAY_CONFDIR/domains.txt` and re-run `init --force` to apply it.
 The same list scopes the proxied DNS server, so the two cannot disagree about what is proxied.
+See [the domain list](#the-domain-list).
 
 In both modes, ads are blackholed, `geoip:private` and bittorrent go direct, and udp/443 is blocked.
 Blocking QUIC makes browsers fall back to TCP TLS, which these proxies can actually carry.
@@ -107,6 +109,31 @@ It has to sit above the proxy rules: below them the proxied domains are exactly 
 
 Torrents going direct is deliberate.
 These are free public nodes shared by strangers, a swarm opens hundreds of connections a second, and it would be both useless over them and abusive to them.
+
+## The domain list
+
+`domains.txt` is an **input**, not a generated file.
+`init` seeds it from a built-in default the first time and never writes it again, so `--force` regenerates the two JSON files *from* it rather than resetting it.
+That is the whole point of the split: without it, the edit-then-apply flow would reset the very list it was applying.
+
+```
+# One matcher per line. Blank lines and # comments are ignored.
+domain:example.com    # the domain and its subdomains
+full:example.com      # that name exactly
+geosite:netflix       # a named set from the geosite data
+keyword:exampl        # substring match
+regexp:^ex.*[.]com$   # a regular expression
+```
+
+A `#` only starts a comment at the start of a line or after whitespace, so a `regexp:` entry containing one survives.
+Duplicates and surrounding whitespace are dropped, which is why the shipped list stopped carrying `nextlgsdp.com` twice.
+
+> An unknown prefix is not an error to xray.
+> `geosit:netflix` is matched as the literal string `geosit:netflix`, which nothing is ever equal to.
+> A typo is therefore a rule that silently never fires, so the reader names the line and the prefix on stderr and carries on.
+
+`--domains PATH` points somewhere else.
+An empty list is refused in `selective` mode, where it would leave the pool carrying nothing but `geoip:telegram`.
 
 ## DNS
 
@@ -285,7 +312,7 @@ xray convert pb conf/*.json | strings | grep -oE 'prox-[a-z]+-[0-9]+' | sort -u 
 - **`fallbackTag` is `block`.** When the strategy can pick nobody, chiefly the window after a restart, traffic is blackholed rather than falling through to whichever node happens to be first. It fails fast instead of timing out against one arbitrary node. It is also why `dns-direct` exists.
 - **`geosite:`/`geoip:` rules need the `.dat` files.** A missing one is a hard startup failure, not a warning. `xray.service` sets `XRAY_LOCATION_ASSET=/usr/share/xray`, which is right for Arch; Debian and the official install script use `/usr/local/share/xray`.
 - **The plain socks/http port is `auth: noauth`.** It defaults to `127.0.0.1`. Point `--proxy-listen` at a docker bridge to serve containers, and firewall it if you widen it further.
-- **`--vless-listen` is off by default and generates its own uuid.** A literal uuid in a config template is a credential every clone shares, on an inbound that is reachable from the network by definition.
+- **`--vless-listen` is off by default and generates its own uuid.** A literal uuid in a config template is a credential every clone shares, on an inbound that is reachable from the network by definition. It is minted **once** and read back on every later `init`, `--force` included, because rolling it leaves the inbound up and listening while every client holding the old one is quietly refused. `--vless-id` sets it explicitly.
 
 ## Migrating
 

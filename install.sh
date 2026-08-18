@@ -44,6 +44,8 @@ else
   install -d -o xray -g xray -m 0750 /etc/xray/conf
   if [[ -d conf && -n "$(ls -A conf 2>/dev/null)" ]]; then
     cp conf/*.json /etc/xray/conf/
+    # domains.txt is config too, and -confdir ignores it for not being .json
+    [[ -f conf/domains.txt ]] && cp conf/domains.txt /etc/xray/conf/
     chown -R xray:xray /etc/xray/conf
     echo "seeded /etc/xray/conf from ./conf"
   else

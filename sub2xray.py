@@ -26,14 +26,32 @@ import io
 import glob
 import json
 import os
+import re
 import sys
 import uuid
 from urllib.parse import urlparse, parse_qs, unquote
 
-# Destinations that must not leave over the local uplink. Used by the
-# selective-mode routing rule and nowhere else: the DNS servers are DoH and
-# resolve everything, so this list no longer has to be repeated there too.
-DOMAIN_LIST = [
+# The seed for domains.txt, used only when that file does not exist yet.
+# The live list is the FILE, not this: edit $XRAY_CONFDIR/domains.txt and
+# re-run `init --force`. Which destinations selective mode proxies, and
+# which names resolve at the exit node, both come from it, so the two
+# cannot disagree about what is proxied.
+DOMAINS_HEADER = """\
+# One matcher per line. Blank lines and # comments are ignored.
+#
+#   domain:example.com    the domain and its subdomains
+#   full:example.com      that name exactly
+#   geosite:netflix       a named set from the geosite data
+#   keyword:exampl        substring match
+#   regexp:^ex.*[.]com$   a regular expression
+#
+# In selective mode these are the destinations that exit through the pool, and
+# the names that are resolved at the exit node rather than here. Edit, then
+# apply with:  sub2xray.py init --force
+#
+"""
+
+DEFAULT_DOMAINS = [
     "domain:accounts.google.com",
     "domain:golang.org",
     "domain:bitbucket.org",
@@ -85,12 +103,6 @@ DOMAIN_LIST = [
     "geosite:discord",
 ]
 
-# The fwmark nftables returns on. EVERY socket xray opens to the outside has
-# to carry it: without it the OUTPUT chain marks the packet 1 and hands it
-# straight back to the tproxy inbound, and xray starts answering its own
-# upstream DNS queries out of its own cache. nftables also skips xray's uid
-# as a second line of defence, because a protocol that ignores sockopt (or a
-# hand-added outbound that forgets it) must not be able to reopen that loop.
 FWMARK = 2
 SOCKOPT = {"mark": FWMARK}
 
@@ -110,6 +122,52 @@ CONFDIR = os.environ.get("XRAY_CONFDIR", "conf")   # ./conf, relative to cwd
 INBOUNDS = "00-inbounds.json"    # sub2xray init
 WIREGUARD = "05-wireguard.json"  # wg-peer - it holds the server key
 ROUTING = "10-routing.json"      # sub2xray init
+# An INPUT, not a generated file. `--force` regenerates the two above FROM
+# this one and never rewrites it - otherwise the edit-then-apply flow would
+# reset the very list it is applying. Not .json, because -confdir would then
+# try to parse it as config.
+DOMAINS = "domains.txt"          # yours to edit; seeded if missing
+
+
+# What xray reads as a matcher rather than as a literal substring. An unknown
+# prefix is NOT an error to xray: "geosit:x" is matched as the plain string
+# "geosit:x", which nothing is ever equal to. A typo is therefore a rule that
+# silently never fires, which is worth a word on stderr.
+DOMAIN_PREFIXES = ("domain:", "geosite:", "full:", "regexp:", "keyword:", "ext:")
+
+
+def ensure_domains(path):
+    """Seed domains.txt if missing, then read it back. Never overwrites."""
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write(DOMAINS_HEADER)
+            f.write("".join(d + "\n" for d in DEFAULT_DOMAINS))
+        print(f"wrote {path} (seeded - edit it, then: init --force)", file=sys.stderr)
+    return read_domains(path)
+
+
+def read_domains(path):
+    """One matcher per line, order preserved, comments and duplicates dropped.
+
+    `#` starts a comment only at the start of a line or after whitespace, so a
+    regexp: entry that contains one survives.
+
+    Deduping here rather than in the literal is why the shipped list stopped
+    carrying nextlgsdp.com twice: whatever you paste in, xray is handed it once.
+    """
+    out, seen = [], set()
+    with open(path) as f:
+        for n, line in enumerate(f, 1):
+            line = re.sub(r"(^|\s)#.*", "", line).strip()
+            if not line:
+                continue
+            if ":" in line and not line.startswith(DOMAIN_PREFIXES):
+                print(f"{path}:{n}: {line.split(':')[0]!r} is not a matcher xray "
+                      f"knows, so this line will match nothing", file=sys.stderr)
+            if line not in seen:
+                seen.add(line)
+                out.append(line)
+    return out
 
 
 def b64d(s):
@@ -377,7 +435,7 @@ def node_id(ob):
     return f"{v['address']}:{v['port']}:{secret}"
 
 
-def inbounds_conf(tproxy_port, proxy_listen, proxy_port, vless, loglevel):
+def inbounds_conf(tproxy_port, proxy_listen, proxy_port, vless, vless_id, loglevel):
     """The tproxy door, plus an ordinary proxy port for things that ask for one.
 
     `all-in` is the transparent one: nftables tproxies every captured packet at
@@ -415,9 +473,12 @@ def inbounds_conf(tproxy_port, proxy_listen, proxy_port, vless, loglevel):
         },
     ]
     if vless:
-        # Opt-in, and the uuid is generated rather than shipped. A literal one
-        # in a config template is a credential everybody who cloned the repo
-        # shares, and this inbound is reachable from the network by definition.
+        # Opt-in, and generated rather than shipped: a literal uuid in a config
+        # template is a credential everybody who cloned the repo shares, on an
+        # inbound reachable from the network by definition. Generated ONCE
+        # though, see read_vless_id. Rolling it on every init would leave the
+        # inbound up and listening while every client that already holds the old
+        # one is quietly refused.
         listen, _, port = vless.rpartition(":")
         inbounds.append({
             "tag": "inbound-external",
@@ -425,7 +486,7 @@ def inbounds_conf(tproxy_port, proxy_listen, proxy_port, vless, loglevel):
             "port": int(port),
             "protocol": "vless",
             "settings": {
-                "clients": [{"id": str(uuid.uuid4()), "email": "peer", "flow": ""}],
+                "clients": [{"id": vless_id, "email": "peer", "flow": ""}],
                 "decryption": "none",
             },
             "sniffing": sniff,
@@ -434,7 +495,7 @@ def inbounds_conf(tproxy_port, proxy_listen, proxy_port, vless, loglevel):
     return {"log": {"loglevel": loglevel}, "inbounds": inbounds}
 
 
-def dns_conf(mode):
+def dns_conf(mode, domains):
     """Split DNS: the proxied set resolves at the exit node, the rest resolves here.
 
     A DNS server's `tag` becomes the INBOUND tag of the queries that server
@@ -444,7 +505,7 @@ def dns_conf(mode):
       dns-proxied  → the balancer.
       dns-direct   → direct.
 
-    In selective mode the proxied server is scoped to DOMAIN_LIST, so the same
+    In selective mode the proxied server is scoped to the domain list, so one
     list decides what is proxied and where its names are resolved; the two
     cannot drift. In full mode it is unscoped, because everything is proxied.
 
@@ -479,7 +540,7 @@ def dns_conf(mode):
     """
     proxied = {"address": "https://1.1.1.1/dns-query", "tag": "dns-proxied"}
     if mode == "selective":
-        proxied["domains"] = DOMAIN_LIST
+        proxied["domains"] = domains
     return {
         "queryStrategy": "UseIPv4",
         "servers": [proxied, {"address": "https://8.8.8.8/dns-query",
@@ -487,7 +548,7 @@ def dns_conf(mode):
     }
 
 
-def routing_conf(probe_interval, mode):
+def routing_conf(probe_interval, mode, domains):
     """The one observatory. Xray allows exactly one, and it cannot be nested.
 
     burstObservatory, not the plain one. The plain observatory sleeps
@@ -499,7 +560,7 @@ def routing_conf(probe_interval, mode):
     Declare only one of the two. Both present and leastLoad silently degrades.
 
     mode="full"       everything exits through the pool; direct is the exception.
-    mode="selective"  DOMAIN_LIST exits through the pool; direct is the default.
+    mode="selective"  the domain list exits through the pool; direct otherwise.
 
     These were the two config*.json.example files in the tproxy repo. They are
     one flag now, because they only ever differed in the last few rules and
@@ -510,12 +571,12 @@ def routing_conf(probe_interval, mode):
         if mode == "full" else
         [
             {"type": "field", "ip": ["geoip:telegram"], "balancerTag": "lb"},
-            {"type": "field", "domain": DOMAIN_LIST, "balancerTag": "lb"},
+            {"type": "field", "domain": domains, "balancerTag": "lb"},
             {"type": "field", "network": "tcp,udp", "outboundTag": "direct"},
         ]
     )
     return {
-        "dns": dns_conf(mode),
+        "dns": dns_conf(mode, domains),
         "outbounds": [
             # Every one of these carries the fwmark. `direct` without it is an
             # instant loop: the packet leaves, the OUTPUT chain marks it 1, and
@@ -621,10 +682,36 @@ def write_pool(outdir, pool, outbounds, size):
     return len(chunks)
 
 
-def write_scaffold(outdir, probe_interval, mode, inbound, force):
+def read_vless_id(path):
+    """The uuid already in 00-inbounds.json, so that a rerun does not roll it.
+
+    It is a credential, and changing it does not break the inbound in any
+    visible way: the port stays open, the listener stays up, and every device
+    holding the old one is simply refused. So it is minted exactly once, on the
+    init that first turns the inbound on, and read back by every init after
+    that - including `--force`, which regenerates the file around it.
+
+    Returns None when there is nothing to reuse, and the caller mints one.
+    """
+    try:
+        with open(path) as f:
+            for i in json.load(f).get("inbounds", []):
+                if i.get("tag") == "inbound-external":
+                    return i["settings"]["clients"][0]["id"]
+    except (OSError, ValueError, KeyError, IndexError):
+        pass          # absent, not json, or not that shape: nothing to reuse
+    return None
+
+
+def write_scaffold(outdir, probe_interval, mode, domains, inbound, force):
     """Create the hand-editable files, but never clobber edits by default."""
+    inbound = dict(inbound)
+    if inbound["vless"] and not inbound.get("vless_id"):
+        inbound["vless_id"] = (read_vless_id(os.path.join(outdir, INBOUNDS))
+                               or str(uuid.uuid4()))
+    inbound.setdefault("vless_id", "")
     for name, conf in ((INBOUNDS, inbounds_conf(**inbound)),
-                       (ROUTING, routing_conf(probe_interval, mode))):
+                       (ROUTING, routing_conf(probe_interval, mode, domains))):
         path = os.path.join(outdir, name)
         if os.path.exists(path) and not force:
             print(f"kept   {path} (--force to rewrite)", file=sys.stderr)
@@ -744,15 +831,17 @@ def _selftest():
         assert glob.glob(f"{d}/50-pool-x-*.json") == [f"{d}/50-pool-x-01.json"]
 
         inb = {"tproxy_port": 12345, "proxy_listen": "127.0.0.1",
-               "proxy_port": 2080, "vless": "", "loglevel": "warning"}
-        write_scaffold(d, "3m", "selective", inb, False)
+               "proxy_port": 2080, "vless": "", "vless_id": "",
+               "loglevel": "warning"}
+        dl = ["domain:a.example", "geosite:netflix"]
+        write_scaffold(d, "3m", "selective", dl, inb, False)
         edited = json.load(open(f"{d}/10-routing.json"))
         edited["routing"]["rules"].insert(0, {"type": "field", "domain": ["mine"]})
         write_json(f"{d}/10-routing.json", edited)
-        write_scaffold(d, "3m", "selective", inb, False)  # refresh must not clobber
+        write_scaffold(d, "3m", "selective", dl, inb, False)  # must not clobber
         assert json.load(open(f"{d}/10-routing.json")) == edited
-        write_scaffold(d, "3m", "selective", inb, True)   # --force must
-        assert json.load(open(f"{d}/10-routing.json")) == routing_conf("3m", "selective")
+        write_scaffold(d, "3m", "selective", dl, inb, True)   # --force must
+        assert json.load(open(f"{d}/10-routing.json")) == routing_conf("3m", "selective", dl)
 
         # The confdir must carry no identity from whoever generated it. A LAN
         # address and a literal uuid were baked in here once; the uuid is a
@@ -765,13 +854,30 @@ def _selftest():
         # ...and logging must stay on stdout, or journald has nothing and
         # alive.sh reads an empty window as "nothing ever failed".
         assert "access" not in inb_json["log"] and "error" not in inb_json["log"]
-        vl = inbounds_conf(12345, "127.0.0.1", 2080, "10.0.0.1:8585", "warning")
+        vl = inbounds_conf(12345, "127.0.0.1", 2080, "10.0.0.1:8585", "u-1", "warning")
         ext = [i for i in vl["inbounds"] if i["tag"] == "inbound-external"][0]
         assert ext["listen"] == "10.0.0.1" and ext["port"] == 8585
-        u1 = ext["settings"]["clients"][0]["id"]
-        u2 = (inbounds_conf(12345, "127.0.0.1", 2080, "10.0.0.1:8585", "warning")
-              ["inbounds"][-1]["settings"]["clients"][0]["id"])
-        assert u1 != u2, "the vless uuid must be generated, not a constant"
+        assert ext["settings"]["clients"][0]["id"] == "u-1"
+
+        # ---- the vless uuid must not move under a rerun ------------------
+        # Rolling it leaves the inbound up and listening while every client
+        # that already holds the old one is quietly refused, so this is a
+        # silent break rather than a visible one.
+        vinb = dict(inb, vless="10.0.0.1:8585")
+        write_scaffold(d, "3m", "selective", dl, vinb, True)
+        first = read_vless_id(f"{d}/00-inbounds.json")
+        assert first, "no uuid was minted"
+        write_scaffold(d, "3m", "selective", dl, vinb, True)   # --force, again
+        assert read_vless_id(f"{d}/00-inbounds.json") == first, "uuid rolled on rerun"
+        # explicit beats reuse
+        write_scaffold(d, "3m", "selective", dl, dict(vinb, vless_id="fixed-1"), True)
+        assert read_vless_id(f"{d}/00-inbounds.json") == "fixed-1"
+        # ...but a confdir with nothing to reuse still mints a RANDOM one; a
+        # uuid derived from anything stable would be a guessable credential.
+        with tempfile.TemporaryDirectory() as d2:
+            write_scaffold(d2, "3m", "selective", dl, vinb, False)
+            assert read_vless_id(f"{d2}/00-inbounds.json") not in (None, first)
+        assert read_vless_id(f"{d}/nonexistent.json") is None
 
     # node_id outlives retirement: alive.sh keys its archive on identity, and the
     # promote step must dedup on it - a tag in two files is silently overwritten
@@ -782,7 +888,7 @@ def _selftest():
     shifted = build("\n".join(uris.splitlines()[::-1]), "de")["outbounds"]
     assert {node_id(o) for o in shifted} == set(ids)
 
-    r = routing_conf("3m", "selective")
+    r = routing_conf("3m", "selective", DEFAULT_DOMAINS)
     # burst only: the plain observatory's interval is a per-node sleep, and
     # declaring both silently degrades the balancer
     assert "observatory" not in r and "burstObservatory" in r
@@ -831,11 +937,12 @@ def _selftest():
     assert rules[idx["dns-direct"]]["outboundTag"] == "direct"
 
     # Split DNS mirrors the routing split: same list, both modes.
-    sel, full = routing_conf("3m", "selective"), routing_conf("3m", "full")
-    assert sel["dns"]["servers"][0]["domains"] == DOMAIN_LIST
+    sel = routing_conf("3m", "selective", DEFAULT_DOMAINS)
+    full = routing_conf("3m", "full", DEFAULT_DOMAINS)
+    assert sel["dns"]["servers"][0]["domains"] == DEFAULT_DOMAINS
     assert "domains" not in full["dns"]["servers"][0]
     assert [rr for rr in sel["routing"]["rules"]
-            if rr.get("domain") == DOMAIN_LIST][0]["balancerTag"] == "lb"
+            if rr.get("domain") == DEFAULT_DOMAINS][0]["balancerTag"] == "lb"
     # Plaintext DNS cannot appear at all: an injected answer is believed and
     # then cached, and afterwards even a working node dials the block address.
     for conf in (sel, full):
@@ -846,6 +953,45 @@ def _selftest():
     assert sel["routing"]["rules"][-1]["outboundTag"] == "direct"
     assert full["routing"]["rules"][-1]["balancerTag"] == "lb"
     assert full["routing"]["rules"][-1]["network"] == "tcp,udp"
+    # ---- domains.txt is config, and is never written over ---------------
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "domains.txt")
+        assert ensure_domains(f) == DEFAULT_DOMAINS       # seeded from the literal
+        assert os.path.exists(f)
+        open(f, "w").write(
+            "# a comment\n"
+            "\n"
+            "  domain:a.example   \n"                      # trimmed
+            "domain:a.example\n"                          # deduped
+            "geosite:netflix  # trailing note\n"           # comment after content
+            "regexp:^x#y$\n")                             # '#' inside a matcher survives
+        assert ensure_domains(f) == ["domain:a.example", "geosite:netflix",
+                                     "regexp:^x#y$"]
+        # seeding is once: a second call must not put the defaults back
+        assert ensure_domains(f) != DEFAULT_DOMAINS
+        # a typo'd matcher is a rule that silently never fires, so it is named
+        buf, old = io.StringIO(), sys.stderr
+        sys.stderr = buf
+        try:
+            open(f, "w").write("geosit:netflix\ndomain:ok.example\n")
+            got = read_domains(f)
+        finally:
+            sys.stderr = old
+        assert got == ["geosit:netflix", "domain:ok.example"]   # passed through
+        assert "'geosit'" in buf.getvalue(), buf.getvalue()     # but called out
+        # an empty list is legal to read; main is what refuses it in selective
+        open(f, "w").write("# nothing but comments\n")
+        assert read_domains(f) == []
+        # ⚠ --force regenerates the two json files FROM this one and must never
+        # rewrite it, or edit-then-apply would reset the list it is applying.
+        open(f, "w").write("domain:kept.example\n")
+        inb = {"tproxy_port": 12345, "proxy_listen": "127.0.0.1", "proxy_port": 2080,
+               "vless": "", "vless_id": "", "loglevel": "warning"}
+        write_scaffold(d, "3m", "selective", read_domains(f), inb, True)
+        assert read_domains(f) == ["domain:kept.example"], "--force rewrote domains.txt"
+        assert json.load(open(f"{d}/10-routing.json"))["dns"]["servers"][0]["domains"] \
+            == ["domain:kept.example"]
+
     print("selftest ok")
 
 
@@ -859,6 +1005,14 @@ if __name__ == "__main__":
     p_init.add_argument("--mode", choices=("selective", "full"), default="selective",
                         help="selective: only DOMAIN_LIST exits via the pool "
                              "(default). full: everything does.")
+    p_init.add_argument("--domains", default=None, metavar="PATH",
+                        help=f"matcher list, one per line (default: "
+                             f"<confdir>/{DOMAINS}, seeded from the built-in "
+                             f"list if absent). Never rewritten, including by "
+                             f"--force: it is the input --force reads.")
+    p_init.add_argument("--vless-id", default="", metavar="UUID",
+                        help="uuid for --vless-listen. Default: reuse the one "
+                             "already in %s, or mint one on first use." % INBOUNDS)
     p_init.add_argument("--probe-interval", default="3m",
                         help="observatory interval; probe rate is nodes/interval")
     p_init.add_argument("--tproxy-port", type=int, default=12345,
@@ -890,17 +1044,22 @@ if __name__ == "__main__":
         _selftest()
     elif args.cmd == "init":
         os.makedirs(args.outdir, exist_ok=True)
-        write_scaffold(args.outdir, args.probe_interval, args.mode,
+        domains = ensure_domains(args.domains
+                                 or os.path.join(args.outdir, DOMAINS))
+        if args.mode == "selective" and not domains:
+            sys.exit("the domain list is empty, so selective mode would proxy "
+                     "nothing but geoip:telegram. Add entries, or use --mode full.")
+        write_scaffold(args.outdir, args.probe_interval, args.mode, domains,
                        {"tproxy_port": args.tproxy_port,
                         "proxy_listen": args.proxy_listen,
                         "proxy_port": args.proxy_port,
                         "vless": args.vless_listen,
+                        "vless_id": args.vless_id,
                         "loglevel": args.loglevel}, args.force)
         if args.vless_listen:
-            path = os.path.join(args.outdir, INBOUNDS)
-            uid = [i for i in json.load(open(path))["inbounds"]
-                   if i["tag"] == "inbound-external"][0]["settings"]["clients"][0]["id"]
-            print(f"vless inbound uuid: {uid}", file=sys.stderr)
+            print(f"vless inbound uuid: "
+                  f"{read_vless_id(os.path.join(args.outdir, INBOUNDS))}",
+                  file=sys.stderr)
         print(f"confdir ready at {args.outdir}/ - add nodes with: "
               f"sub2xray.py pool --name <name> <sub>", file=sys.stderr)
         print(f"wireguard peers go in {args.outdir}/{WIREGUARD} via wg-peer.sh",
