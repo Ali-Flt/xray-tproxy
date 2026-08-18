@@ -237,6 +237,46 @@ No `network` and no `security`, so xray keeps its raw TCP defaults.
 **`conf/` and `subs/` are gitignored.**
 Pool files carry uuids, passwords and reality keys, and a subscription file is the same credentials in URI form, often the account itself.
 
+## Turning the logging down
+
+xray writes two logs, and `loglevel` only governs one of them.
+
+| log | controlled by | carries |
+|---|---|---|
+| error | `--loglevel` | startup, dial failures, and the observatory verdicts `alive.sh` reads |
+| access | `--access-log` | one line per connection, plus one per DNS cache hit |
+
+The access log is the volume.
+It is not levelled, so `--loglevel error` does not quiet it by a single line, and left unset xray sends it to stdout where journald keeps all of it.
+It is `none` here by default, which is off.
+
+```sh
+sudo -E ./sub2xray.py init --force --loglevel warning   # the default
+sudo systemctl restart xray
+```
+
+| `--loglevel` | journal volume | what `alive.sh` can still do |
+|---|---|---|
+| `debug` | very high | full: reports who failed *and* who answered |
+| `warning` (default) | low | prune: reports who failed |
+| `error` | near silent | nothing, the observatory logs its failures at warning |
+| `none` | silent | nothing |
+
+So `warning` is the floor if you want `alive.sh` to keep working, and `debug` is worth turning on only for the window in which you are actually pruning.
+
+`dnsLog` is left off. Turning it on adds a line per lookup per server, which with a fallback list is several lines per name.
+
+If the remaining volume is still too much, cap it on the journald side rather than blinding the tools:
+
+```sh
+sudo journalctl --vacuum-size=200M
+sudo systemctl edit xray        # [Service] LogRateLimitIntervalSec=30s
+                                #           LogRateLimitBurst=1000
+```
+
+To silence it completely, `--loglevel none --access-log none`, or `StandardOutput=null` in the unit.
+Both leave `alive.sh` with nothing to read, and leave you with no record of why a node stopped working.
+
 ## Which of my nodes are alive?
 
 ```sh

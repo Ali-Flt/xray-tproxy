@@ -409,7 +409,8 @@ def node_id(ob):
     return f"{v['address']}:{v['port']}:{secret}"
 
 
-def inbounds_conf(tproxy_port, proxy_listen, proxy_port, vless, vless_id, loglevel):
+def inbounds_conf(tproxy_port, proxy_listen, proxy_port, vless, vless_id,
+                  loglevel, access_log):
     """The tproxy door, plus an ordinary proxy port for things that ask for one.
 
     `all-in` is the transparent one: nftables tproxies every captured packet at
@@ -473,7 +474,20 @@ def inbounds_conf(tproxy_port, proxy_listen, proxy_port, vless, vless_id, loglev
             "sniffing": sniff,
             "streamSettings": {"network": "tcp", "security": "none"},
         })
-    return {"log": {"loglevel": loglevel}, "inbounds": inbounds}
+    # Two independent logs, and only one of them is what `loglevel` controls.
+    #
+    #   error   levelled by `loglevel`. Carries the observatory verdicts, which
+    #           is the whole of what alive.sh reads.
+    #   access  one line per connection, plus one per DNS cache hit. NOT
+    #           levelled: `loglevel: error` does not quiet it by a single line.
+    #           Unset it defaults to stdout, so under systemd the entire stream
+    #           lands in journald. "none" is what turns it off, and off is the
+    #           default here because nothing in this repo reads it.
+    #
+    # dnsLog is left unset, which is off. Turning it on adds a line per lookup
+    # per server, and with a serial-query list that is four lines a name.
+    return {"log": {"loglevel": loglevel, "access": access_log},
+            "inbounds": inbounds}
 
 
 def dns_conf(mode, domains):
@@ -813,7 +827,7 @@ def _selftest():
 
         inb = {"tproxy_port": 12345, "proxy_listen": "127.0.0.1",
                "proxy_port": 2080, "vless": "", "vless_id": "",
-               "loglevel": "warning"}
+               "loglevel": "warning", "access_log": "none"}
         dl = ["domain:a.example", "geosite:netflix"]
         write_scaffold(d, "3m", "selective", dl, inb, False)
         edited = json.load(open(f"{d}/10-routing.json"))
@@ -834,8 +848,14 @@ def _selftest():
         assert "192.168.1." not in blob and "fb78e7cd" not in blob, blob
         # ...and logging must stay on stdout, or journald has nothing and
         # alive.sh reads an empty window as "nothing ever failed".
-        assert "access" not in inb_json["log"] and "error" not in inb_json["log"]
-        vl = inbounds_conf(12345, "127.0.0.1", 2080, "10.0.0.1:8585", "u-1", "warning")
+        # The error log stays on stdout: journald is what alive.sh reads.
+        assert "error" not in inb_json["log"]
+        # The access log is off by default. Unset it is not off, it is stdout,
+        # and --loglevel cannot quiet it - it is a separate stream.
+        assert inb_json["log"]["access"] == "none", inb_json["log"]
+        assert "dnsLog" not in inb_json["log"]
+        vl = inbounds_conf(12345, "127.0.0.1", 2080, "10.0.0.1:8585", "u-1",
+                           "warning", "none")
         ext = [i for i in vl["inbounds"] if i["tag"] == "inbound-external"][0]
         assert ext["listen"] == "10.0.0.1" and ext["port"] == 8585
         assert ext["settings"]["clients"][0]["id"] == "u-1"
@@ -967,7 +987,8 @@ def _selftest():
         # rewrite it, or edit-then-apply would reset the list it is applying.
         open(f, "w").write("domain:kept.example\n")
         inb = {"tproxy_port": 12345, "proxy_listen": "127.0.0.1", "proxy_port": 2080,
-               "vless": "", "vless_id": "", "loglevel": "warning"}
+               "vless": "", "vless_id": "", "loglevel": "warning",
+               "access_log": "none"}
         write_scaffold(d, "3m", "selective", read_domains(f), inb, True)
         assert read_domains(f) == ["domain:kept.example"], "--force rewrote domains.txt"
         assert json.load(open(f"{d}/10-routing.json"))["dns"]["servers"][0]["domains"] \
@@ -1012,7 +1033,16 @@ if __name__ == "__main__":
                              "generated and printed, never shipped in the repo.")
     p_init.add_argument("--loglevel", default="warning",
                         choices=("debug", "info", "warning", "error", "none"),
-                        help="debug makes alive.sh able to confirm who answered")
+                        help="error log only. warning (default) keeps the "
+                             "observatory failures alive.sh prunes on; debug "
+                             "adds who answered; error and none leave alive.sh "
+                             "with nothing to read.")
+    p_init.add_argument("--access-log", default="none", metavar="PATH",
+                        help="the per-connection log, which is the bulk of the "
+                             "volume and is not affected by --loglevel. 'none' "
+                             "(default) turns it off. A path writes it there; "
+                             "unset entirely, xray sends it to stdout and "
+                             "journald keeps all of it.")
     p_init.add_argument("--force", action="store_true",
                         help="rewrite the files, discarding your edits")
 
@@ -1040,7 +1070,8 @@ if __name__ == "__main__":
                         "proxy_port": args.proxy_port,
                         "vless": args.vless_listen,
                         "vless_id": args.vless_id,
-                        "loglevel": args.loglevel}, args.force)
+                        "loglevel": args.loglevel,
+                        "access_log": args.access_log}, args.force)
         # Said out loud at the moment the config is written, not only in --help.
         # An open relay is found by scanners in days and the first symptom is
         # somebody else's traffic, which is a long way from this file. Narrowing
