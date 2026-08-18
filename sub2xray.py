@@ -652,6 +652,63 @@ def routing_conf(probe_interval, mode, domains):
     }
 
 
+# Above this many nodes the observatory's load is worth saying out loud. Not a
+# limit: a pool grows one subscription at a time and the cost of it is invisible
+# until the balancer stops converging, which looks like bad nodes rather than
+# too many of them.
+PROBE_BUDGET = 200
+
+
+def interval_seconds(text):
+    """'3m' -> 180. Only needed to do arithmetic on what xray was given."""
+    try:
+        return int(text[:-1]) * {"s": 1, "m": 60, "h": 3600}[text[-1]]
+    except (ValueError, KeyError, IndexError):
+        return None
+
+
+def probe_load_note(outdir):
+    """Say what the observatory has just been signed up for.
+
+    burstObservatory probes every subject CONCURRENTLY each round and has no
+    backoff, so a node that has been dead for a week is still dialled every
+    interval. Nothing in xray reports the resulting rate, and the failure mode
+    is indirect: probes start timing out under their own weight, leastPing
+    never gets a clean round, and the balancer looks like it is full of bad
+    nodes rather than too many of them.
+    """
+    tags = set()
+    for f in glob.glob(os.path.join(outdir, "50-pool-*.json")):
+        try:
+            with open(f) as fh:
+                tags.update(o.get("tag", "")
+                            for o in json.load(fh).get("outbounds", []))
+        except (OSError, ValueError):
+            continue          # a half-written pool is not this function's problem
+    n = sum(1 for t in tags if t.startswith(TAG_PREFIX))
+    if n <= PROBE_BUDGET:
+        return
+    interval = None
+    try:
+        with open(os.path.join(outdir, ROUTING)) as fh:
+            interval = json.load(fh)["burstObservatory"]["pingConfig"]["interval"]
+    except (OSError, ValueError, KeyError):
+        pass
+    secs = interval_seconds(interval or "")
+    say = lambda m: print(m, file=sys.stderr)
+    say(f"\nwarning: {n} outbounds now match the observatory selector "
+        f"{TAG_PREFIX!r}.")
+    if secs:
+        say(f"  At interval {interval} that is {n / secs:.1f} probes/sec sustained, "
+            f"and {n} concurrent dials every time xray restarts.")
+    say("  burst probes every subject at once and never backs off, so a node that "
+        "has been\n  dead for a week is dialled again every round. Cut it with any of:")
+    say("      ./alive.sh --prune")
+    say(f"      sub2xray.py pool --limit {PROBE_BUDGET} ...")
+    if secs:
+        say(f"      sub2xray.py init --force --probe-interval {max(3, n // 60)}m")
+
+
 def write_json(path, obj):
     with open(path, "w") as f:
         json.dump(obj, f, indent=2)
@@ -954,6 +1011,36 @@ def _selftest():
     assert sel["routing"]["rules"][-1]["outboundTag"] == "direct"
     assert full["routing"]["rules"][-1]["balancerTag"] == "lb"
     assert full["routing"]["rules"][-1]["network"] == "tcp,udp"
+    # ---- the observatory's cost is reported, and boundable ---------------
+    assert interval_seconds("3m") == 180 and interval_seconds("90s") == 90
+    assert interval_seconds("1h") == 3600
+    assert interval_seconds("") is None and interval_seconds("3x") is None
+    with tempfile.TemporaryDirectory() as d:
+        write_json(os.path.join(d, ROUTING), routing_conf("3m", "full", ["x"]))
+        big = [{"tag": f"prox-p-{i}"} for i in range(1, PROBE_BUDGET + 51)]
+        write_pool(d, "p", big, 0)
+        buf, old_err = io.StringIO(), sys.stderr
+        sys.stderr = buf
+        try:
+            probe_load_note(d)
+        finally:
+            sys.stderr = old_err
+        note = buf.getvalue()
+        # the count, the rate and the restart burst all have to be in it: the
+        # number alone does not tell anyone it is a problem
+        assert f"{PROBE_BUDGET + 50} outbounds" in note, note
+        assert "probes/sec" in note and "concurrent dials" in note, note
+        assert "alive.sh --prune" in note and "--limit" in note, note
+        # a pool inside the budget says nothing at all
+        write_pool(d, "p", big[:10], 0)
+        buf, old_err = io.StringIO(), sys.stderr
+        sys.stderr = buf
+        try:
+            probe_load_note(d)
+        finally:
+            sys.stderr = old_err
+        assert buf.getvalue() == "", buf.getvalue()
+
     # ---- domains.txt is config, and is never written over ---------------
     with tempfile.TemporaryDirectory() as d:
         f = os.path.join(d, "domains.txt")
@@ -1051,6 +1138,11 @@ if __name__ == "__main__":
     p_pool.add_argument("--name", default="main", help="pool name, namespaces the tags")
     p_pool.add_argument("--size", type=int, default=0, metavar="N",
                         help="nodes per file; 0 (default) puts them all in one")
+    p_pool.add_argument("--limit", type=int, default=0, metavar="N",
+                        help="keep at most N nodes from this subscription "
+                             "(0 = all). The observatory probes every node it "
+                             "is given, concurrently, every interval, so this "
+                             "is the lever that bounds that cost at the source.")
 
     sub.add_parser("selftest", help="run the internal checks")
     args = ap.parse_args()
@@ -1097,7 +1189,14 @@ if __name__ == "__main__":
                      f"--outdir {args.outdir} init")
         src = open(args.source).read() if args.source else sys.stdin.read()
         outbounds = build(src, args.name)["outbounds"]
+        # Named, not silent. Dropping most of a subscription without a word is
+        # the same failure as a subscription that silently halves.
+        if 0 < args.limit < len(outbounds):
+            print(f"--limit: keeping {args.limit} of {len(outbounds)} nodes in "
+                  f"pool '{args.name}'; the rest are not written", file=sys.stderr)
+            outbounds = outbounds[:args.limit]
         n = write_pool(args.outdir, args.name, outbounds, args.size)
         print(f"{len(outbounds)} nodes in pool '{args.name}' across {n} file(s)",
               file=sys.stderr)
+        probe_load_note(args.outdir)
 

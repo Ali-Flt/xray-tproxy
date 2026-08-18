@@ -306,6 +306,59 @@ sudo systemctl edit xray        # [Service] LogRateLimitIntervalSec=30s
 To silence it completely, `--loglevel none --access-log none`, or `StandardOutput=null` in the unit.
 Both leave `alive.sh` with nothing to read, and leave you with no record of why a node stopped working.
 
+## Sizing the pool
+
+`burstObservatory` probes **every** subject **concurrently**, every `interval`, and never backs off.
+A node that has been dead for a week is dialled again every round, forever.
+So the cost is `nodes / interval` sustained, plus a burst the width of the whole pool every time xray restarts.
+
+At 2000 nodes and the default `3m` that is 11 probes/sec and 2000 simultaneous dials on startup.
+The failure is indirect and easy to misread: probes start timing out under their own weight, `leastPing` never gets a clean round, and the balancer looks like it is full of bad nodes rather than holding too many of them.
+
+`pool` now reports the arithmetic whenever the total passes 200:
+
+```
+800 nodes in pool 'main' across 16 file(s)
+
+warning: 800 outbounds now match the observatory selector 'prox'.
+  At interval 3m that is 4.4 probes/sec sustained, and 800 concurrent dials every time xray restarts.
+```
+
+Three levers, best first:
+
+**1. Take fewer nodes.** The lever at the source, and the only one that also shrinks the startup burst:
+
+```sh
+./sub2xray.py pool --name main --limit 150 sub.txt
+```
+
+It says what it dropped rather than quietly keeping the first N.
+
+**2. Prune what is already dead.** Measured rather than guessed, so it removes nodes you were paying to probe and could never have used:
+
+```sh
+./sub2xray.py init --force --loglevel debug && sudo systemctl restart xray
+sleep 900
+./alive.sh --prune && sudo systemctl restart xray
+./sub2xray.py init --force --loglevel warning   # put the log back down
+```
+
+**3. Slow the rounds down.** Cheapest to apply, but it does not touch the startup burst - the whole pool is still dialled at once when xray starts:
+
+```sh
+./sub2xray.py init --force --probe-interval 20m
+```
+
+Roughly one probe per second is a reasonable target, so `interval` in seconds around the node count.
+
+> A subscription is not a pool.
+> Feeding a 2000-entry subscription straight in gives you 2000 nodes of which a few dozen work, and the observatory pays full price for all of them on every round.
+> `--limit` plus a periodic `--prune` keeps the working set roughly the size of what actually works.
+
+Two things that look like levers and are not.
+`sampling` is the width of the moving average, not a rate: changing it does not alter how often anything is dialled.
+And `timeout` only decides how long a failing probe occupies a socket, not how many are opened.
+
 ## Which of my nodes are alive?
 
 ```sh
@@ -410,7 +463,7 @@ xray convert pb conf/*.json | strings | grep -oE 'prox-[a-z]+-[0-9]+' | sort -u 
 
 - **One observatory, globally.** Observatories cannot be chained or nested, and every balancer shares this one. Probe scope is `subjectSelector` alone, never balancer membership.
 - **`burstObservatory`, never the plain `observatory`.** The plain one sleeps `probeInterval` *between each outbound*, so the interval is a per-node delay rather than a round period. Measured at 4 of 50 nodes reached in 40s at a 10s interval, which over 200 nodes at `3m` would be a ten hour round. Declare only one of the two; with both present, `leastLoad` silently degrades.
-- **Probe rate is `nodes / interval`.** At `3m`, 200 nodes is about 1.1 probes/sec. `sampling` is a window, not a rate. There is no backoff, so a dead node is re-probed forever, which is why pruning happens here rather than in Xray. **Keep the pool to a few dozen live nodes.** A pool of 2000 spends its whole life probing and the balancer never converges.
+- **Probe rate is `nodes / interval`, and the burst is the whole pool at once.** See [Sizing the pool](#sizing-the-pool).
 - **Startup fires every probe at once**, with no spread.
 - **`fallbackTag` is `block`.** When the strategy can pick nobody, chiefly the window after a restart, traffic is blackholed rather than falling through to whichever node happens to be first. It fails fast instead of timing out against one arbitrary node. It is also why `dns-direct` exists.
 - **`geosite:`/`geoip:` rules need the `.dat` files.** A missing one is a hard startup failure, not a warning. `xray.service` sets `XRAY_LOCATION_ASSET=/usr/share/xray`, which is right for Arch; Debian and the official install script use `/usr/local/share/xray`.
