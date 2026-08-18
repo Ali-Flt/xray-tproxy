@@ -444,6 +444,13 @@ def inbounds_conf(tproxy_port, proxy_listen, proxy_port, vless, vless_id, loglev
     bridge the ruleset does not cover, or an app you would rather point at a
     proxy explicitly.
 
+    ⚠ It listens on 0.0.0.0 by default and is `auth: noauth`, which is an open
+    proxy to anything that can route to this host. That is a deliberate choice
+    for a LAN gateway and a trust boundary you own: firewall the port, or pass
+    --proxy-listen a narrower address. nftables also has to leave that port
+    alone, or a connection to it arriving on a public interface is tproxy'd
+    into the transparent door instead of reaching it - see KEEP_DIRECT_PORTS.
+
     Sniffing is on so routing rules can match domains; without it a rule sees
     only the IP, and every domain rule in 10-routing.json is dead weight.
 
@@ -1017,9 +1024,13 @@ if __name__ == "__main__":
                         help="observatory interval; probe rate is nodes/interval")
     p_init.add_argument("--tproxy-port", type=int, default=12345,
                         help="dokodemo-door port nftables tproxies at (default: 12345)")
-    p_init.add_argument("--proxy-listen", default="127.0.0.1",
-                        help="listen address for the plain socks/http port. Use the "
-                             "docker bridge (172.17.0.1) to serve containers.")
+    p_init.add_argument("--proxy-listen", default="0.0.0.0",
+                        help="listen address for the plain socks/http port. "
+                             "Default 0.0.0.0 serves every interface, including "
+                             "any public one. That port is auth:noauth, so it is "
+                             "an open proxy to whoever can route to it: firewall "
+                             "it, or narrow this to a LAN or docker-bridge "
+                             "address (172.17.0.1 for containers).")
     p_init.add_argument("--proxy-port", type=int, default=2080)
     p_init.add_argument("--vless-listen", default="", metavar="ADDR:PORT",
                         help="also serve an inbound vless listener, e.g. "
