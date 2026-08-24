@@ -157,6 +157,13 @@ def stream(net, security, sni, host, path, service, fp, pbk, sid):
         ss["wsSettings"] = {"path": path or "/", "headers": {"Host": host or sni}}
     elif net == "grpc":
         ss["grpcSettings"] = {"serviceName": service}
+    elif net == "xhttp":
+        # XHTTP (formerly HTTP transport): needs a path, defaults to /.
+        # host is optional — if absent, serverName is used.
+        ss["xhttpSettings"] = {
+            "path": path or "/",
+            "host": host or sni,
+        }
     # tcp needs nothing extra
     if security == "tls":
         ss["tlsSettings"] = {"serverName": sni, "fingerprint": fp or "chrome"}
@@ -172,6 +179,11 @@ def parse_vless(uri, tag):
     u = urlparse(uri)
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
     sni = q.get("sni", u.hostname)
+    # HTTP transport was removed and migrated to XHTTP. Convert type=http →
+    # type=xhttp so the node survives. XHTTP needs a path (defaults to /).
+    net = q.get("type", "tcp")
+    if net == "http":
+        net = "xhttp"
     out = {
         "tag": tag,
         "protocol": "vless",
@@ -181,7 +193,7 @@ def parse_vless(uri, tag):
                        "flow": q.get("flow", "")}],
         }]},
         "streamSettings": stream(
-            q.get("type", "tcp"), q.get("security", "none"), sni,
+            net, q.get("security", "none"), sni,
             q.get("host", ""), unquote(q.get("path", "/")),
             q.get("serviceName", ""), q.get("fp", ""),
             q.get("pbk", ""), q.get("sid", "")),
@@ -193,6 +205,8 @@ def parse_trojan(uri, tag):
     u = urlparse(uri)
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
     sni = q.get("sni", u.hostname)
+    if q.get("type", "tcp") == "http":
+        q["type"] = "xhttp"
     out = {
         "tag": tag,
         "protocol": "trojan",
@@ -213,6 +227,8 @@ def parse_vmess(uri, tag):
     c = json.loads(b64d(uri[len("vmess://"):]))
     sni = c.get("sni") or c.get("host") or c.get("add")
     net = c.get("net", "tcp")
+    if net == "http":
+        net = "xhttp"
     security = "tls" if str(c.get("tls", "")) in ("tls", "true", "1") else "none"
     out = {
         "tag": tag,
