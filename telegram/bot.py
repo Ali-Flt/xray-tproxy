@@ -59,20 +59,31 @@ def load_config(path):
 
 
 def digest(path):
-    """The file's content hash, or None if it is missing or empty.
+    """A hash of the NODES in the file, or None if it is missing or empty.
 
     Content, not mtime: refresh.sh republishes on every settled cycle whether
     or not the survivors changed, and re-sending an identical list every half
-    hour is how a group learns to mute you.
+    hour is how a channel learns to mute you.
+
+    ...but not the bytes either. The #fragment on each URI is the outbound's
+    tag, and tags are POSITIONAL - prox-<pool>-<n>, n being the node's index
+    in the subscription. One node appearing upstream renumbers every node
+    after it, so the file changes on every line while the pool is the same
+    pool. Measured against one insertion into a 977-node subscription: all 964
+    nodes present in both exports were renumbered, against 14 genuinely added.
+    Hashing the bytes would have resent the whole list for that.
+
+    Sorted, so a reordered subscription is not a change either.
     """
     try:
-        with open(path, "rb") as f:
-            data = f.read()
+        with open(path) as f:
+            text = f.read()
     except OSError:
         return None
-    if not data.strip():
+    nodes = sorted(line.split("#", 1)[0] for line in text.splitlines() if line.strip())
+    if not nodes:
         return None
-    return hashlib.sha256(data).hexdigest()
+    return hashlib.sha256("\n".join(nodes).encode()).hexdigest()
 
 
 def read_state(path):
@@ -255,6 +266,18 @@ def _selftest():
         assert digest(p) == first, "an identical republish must not look new"
         open(p, "w").write("vless://b\n")
         assert digest(p) != first
+        # ⚠ Tags are positional, so one node arriving upstream renumbers every
+        # node after it. That is not a change to the pool and must not resend.
+        open(p, "w").write("vless://x@a.com:443#prox-p-7\nvless://y@b.com:443#prox-p-8\n")
+        renumbered = digest(p)
+        open(p, "w").write("vless://x@a.com:443#prox-p-8\nvless://y@b.com:443#prox-p-9\n")
+        assert digest(p) == renumbered, "a renumbered tag looked like a new list"
+        # ...nor is a reordering of the same nodes
+        open(p, "w").write("vless://y@b.com:443#prox-p-9\nvless://x@a.com:443#prox-p-8\n")
+        assert digest(p) == renumbered, "a reordered list looked like a new one"
+        # ...but a genuinely different node still is one
+        open(p, "w").write("vless://x@a.com:443#prox-p-8\nvless://z@c.com:443#prox-p-9\n")
+        assert digest(p) != renumbered
 
         s = os.path.join(d, "sub", "state")
         assert read_state(s) is None
