@@ -3,6 +3,7 @@
 #
 #   ./alive.sh                    report only
 #   ./alive.sh --prune            delete the dead
+#   ./alive.sh --prune && sub2xray.py export > working.txt   # the survivors
 #   ./alive.sh --help
 #   ./alive.sh selftest           stub journalctl; no service, no network
 #   XRAY_CONFDIR=conf ./alive.sh
@@ -340,6 +341,10 @@ if [[ $PRUNE -eq 1 ]]; then
     done
     echo "  deleted $n_failed node(s)"
     echo "  restart to apply: systemctl restart ${SCOPE#--system} $UNIT"
+    # What is left in the pool files is the set that survived this prune, and
+    # sub2xray owns the JSON-to-URI direction, so the export lives there rather
+    # than being rebuilt in jq here.
+    echo "  export the survivors:  sub2xray.py export > working.txt"
   fi
 fi
 

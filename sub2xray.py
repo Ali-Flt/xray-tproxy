@@ -5,10 +5,13 @@
     python3 sub2xray.py pool --name de --size 20 sub.txt
     curl -s "$SUBURL" | python3 sub2xray.py pool --name nl --size 20
     xray run -confdir conf
+    python3 sub2xray.py export > working.txt   # the pool, back as URIs
 
-Two commands because they have different lifecycles. `init` writes the config
+Three commands because they have different lifecycles. `init` writes the config
 you then hand-edit and rarely touch; `pool` rewrites node files every refresh.
 Conflating them is how a subscription refresh silently reverts your routing.
+`export` is the way back out, and owns no state of its own: it rebuilds each
+URI from the outbound, so after `alive.sh --prune` it prints what survived.
 
 This owns the secret-free half of the confdir. The wireguard inbound
 (05-wireguard.json) belongs to wg-peer.sh, because only it can generate the
@@ -29,7 +32,7 @@ import os
 import re
 import sys
 import uuid
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, urlencode, quote
 
 # The seed for domains.txt, used only when that file does not exist yet.
 # The live list is the FILE, not this: edit $XRAY_CONFDIR/domains.txt and
@@ -395,6 +398,115 @@ def parse(uri, tag):
         # anything but version 2 - "version != 2". v1 is dead upstream anyway.
         raise ValueError("hysteria v1: xray's hysteria outbound only speaks version 2")
     return None  # anything else: no such outbound in xray-core
+
+
+def _hostport(address, port):
+    """host:port, re-bracketing an IPv6 literal that was stored bare."""
+    return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
+
+
+def _stream_query(ss):
+    """streamSettings back into the query parameters parse() reads them from."""
+    q = {}
+    net = ss.get("network", "tcp")
+    if net != "tcp":
+        q["type"] = net
+    if net == "ws":
+        w = ss.get("wsSettings", {})
+        q["path"] = w.get("path", "/")
+        host = w.get("headers", {}).get("Host", "")
+        if host:
+            q["host"] = host
+    elif net == "grpc":
+        q["serviceName"] = ss.get("grpcSettings", {}).get("serviceName", "")
+    elif net == "xhttp":
+        x = ss.get("xhttpSettings", {})
+        q["path"] = x.get("path", "/")
+        if x.get("host"):
+            q["host"] = x["host"]
+    tls = ss.get("tlsSettings") or ss.get("realitySettings") or {}
+    for key, field in (("sni", "serverName"), ("fp", "fingerprint"),
+                       ("pbk", "publicKey"), ("sid", "shortId")):
+        if tls.get(field):
+            q[key] = tls[field]
+    return q
+
+
+def to_uri(ob):
+    """The inverse of parse(): one outbound back to the URI it came from.
+
+    Nothing keeps the original URI list - a subscription is refetched, not
+    stored - so the pool files are the only record of a node, and exporting
+    means rebuilding the URI from what xray is actually configured with. That
+    is exact for everything that reaches xray, and drops exactly what parse()
+    dropped on the way in:
+
+      - the node's display name. The tag stands in for it, which is more
+        useful anyway: it names the pool the node came from.
+      - hysteria2's sni= and insecure=. parse_hysteria2 does not keep them, so
+        they are not in this config either; a URI carrying them would be
+        claiming more than xray was told.
+
+    Returns None for an outbound with no URI form (direct, block, dns-out),
+    so that a hand-added file in the confdir cannot break an export.
+    """
+    proto, tag = ob.get("protocol"), ob.get("tag", "")
+    st, ss = ob.get("settings", {}), ob.get("streamSettings", {})
+    frag = "#" + quote(tag, safe="") if tag else ""
+    if proto == "vless":
+        v = st["vnext"][0]
+        user = v["users"][0]
+        q = _stream_query(ss)
+        # vless defaults to security=none, so it is omitted when it is that
+        if ss.get("security", "none") != "none":
+            q["security"] = ss["security"]
+        if user.get("encryption", "none") != "none":
+            q["encryption"] = user["encryption"]
+        if user.get("flow"):
+            q["flow"] = user["flow"]
+        return (f"vless://{quote(user['id'], safe='')}@"
+                f"{_hostport(v['address'], v['port'])}?{urlencode(q)}{frag}")
+    if proto == "trojan":
+        srv = st["servers"][0]
+        q = _stream_query(ss)
+        # ...trojan defaults to tls, so security is always explicit here: an
+        # omitted one would be read back as tls whatever it actually is.
+        q["security"] = ss.get("security", "tls")
+        return (f"trojan://{quote(srv['password'], safe='')}@"
+                f"{_hostport(srv['address'], srv['port'])}?{urlencode(q)}{frag}")
+    if proto == "vmess":
+        v = st["vnext"][0]
+        user = v["users"][0]
+        net = ss.get("network", "tcp")
+        q = _stream_query(ss)
+        conf = {
+            "v": "2", "ps": tag, "add": v["address"], "port": str(v["port"]),
+            "id": user["id"], "aid": str(user.get("alterId", 0)),
+            "scy": user.get("security", "auto"), "net": net,
+            "host": q.get("host", ""),
+            # grpc has no path: parse_vmess reads the service name out of it
+            "path": (ss.get("grpcSettings", {}).get("serviceName", "")
+                     if net == "grpc" else q.get("path", "")),
+            "tls": "tls" if ss.get("security") == "tls" else "",
+            "sni": q.get("sni", ""), "fp": q.get("fp", ""),
+        }
+        return "vmess://" + base64.b64encode(
+            json.dumps(conf).encode()).decode()
+    if proto == "shadowsocks":
+        srv = st["servers"][0]
+        method, password = srv["method"], srv["password"]
+        if method.startswith("2022-"):
+            # 2022 keys are base64 already and the spec keeps them in the
+            # clear; base64ing the pair again is the shape clients get wrong.
+            userinfo = f"{method}:{quote(password, safe='')}"
+        else:
+            userinfo = base64.urlsafe_b64encode(
+                f"{method}:{password}".encode()).decode().rstrip("=")
+        return f"ss://{userinfo}@{_hostport(srv['address'], srv['port'])}{frag}"
+    if proto == "hysteria":
+        return (f"hysteria2://{quote(st.get('password', ''), safe='')}@"
+                f"{_hostport(st['address'], st['port'])}{frag}")
+    return None
 
 
 def _where(uri):
@@ -790,6 +902,49 @@ def write_pool(outdir, pool, outbounds, size):
     return len(chunks)
 
 
+def export_uris(outdir, name=None):
+    """The pool files, back as a URI list. Order follows the tags.
+
+    What is in the pool files is what xray is dialling, so after a prune this
+    is the set of nodes that survived it - alive.sh deletes the dead ones from
+    exactly these files. No aliveness is judged here; the confdir is.
+
+    Deduped by node_id rather than by URI: the same node reached from two
+    subscriptions parses into two tags and two different-looking URIs, and
+    whoever imports this list would then probe it twice.
+    """
+    pattern = f"50-pool-{name}-*.json" if name else "50-pool-*.json"
+    uris, seen, unconvertible = [], set(), []
+    for path in sorted(glob.glob(os.path.join(outdir, pattern))):
+        try:
+            with open(path) as f:
+                outbounds = json.load(f).get("outbounds", [])
+        except (OSError, ValueError) as e:
+            print(f"{path}: {e}", file=sys.stderr)
+            continue
+        for ob in outbounds:
+            try:
+                uri = to_uri(ob)
+            except (KeyError, IndexError, TypeError) as e:
+                unconvertible.append(f"{ob.get('tag', '?')} - {e}")
+                continue
+            if uri is None:
+                unconvertible.append(
+                    f"{ob.get('tag', '?')} - no URI form for protocol "
+                    f"{ob.get('protocol', '?')!r}")
+                continue
+            ident = node_id(ob)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            uris.append(uri)
+    # Named, like every other skip in this file. A list that quietly comes back
+    # short is the failure mode the whole tool is written against.
+    for why in unconvertible:
+        print(f"not exported: {why}", file=sys.stderr)
+    return uris
+
+
 def read_vless_id(path):
     """The uuid already in 00-inbounds.json, so that a rerun does not roll it.
 
@@ -941,6 +1096,30 @@ def _selftest():
             parse(bad, "t"); assert False, f"{bad} should have been refused"
         except ValueError:
             pass
+
+    # ---- to_uri is the inverse of parse ---------------------------------
+    # The pool files are the only record of a node, so a field lost on the way
+    # back out is a node that silently stops working wherever it is imported.
+    # Compare the OUTBOUND rather than the string: what matters is that xray,
+    # and whatever reads the export, are handed the same node.
+    for u in (
+        "vless://uid@ex.com:443?type=ws&security=tls&sni=h.com&host=h.com&path=%2Fp&fp=chrome#n",
+        "vless://uid@ex.com:443?security=reality&pbk=k&sid=ab&fp=firefox&flow=xtls-rprx-vision#n",
+        "vless://uid@ex.com:8443?type=grpc&security=tls&serviceName=svc&sni=h.com#n",
+        "vless://uid@ex.com:80#no-tls-at-all",
+        "vless://uid@[2001:db8::1]:443?security=tls&sni=h.com#v6",
+        "trojan://p%40ss@ex.com:443?type=ws&security=tls&sni=h.com&path=%2Fp#n",
+        "trojan://ZcV1AKzS1KPuLXOvW3RXr+HFldso5hZoaMpZ/qbeEW4=@1.2.3.4:2053?security=tls&fp=chrome#DE",
+        "vmess://" + raw,
+        sip,
+        f"ss://2022-blake3-aes-256-gcm:{k1}:{k2}@s.com:8388#keys",
+        "hysteria2://p%40ss@h.example:8443#Oslo",
+    ):
+        ob = parse(u, "prox-rt-1")
+        back = to_uri(ob)
+        assert parse(back, "prox-rt-1") == ob, f"{u}\n  -> {back}\n  {parse(back, 'prox-rt-1')}\n  {ob}"
+    # An outbound with no URI form is named, never dropped in silence
+    assert to_uri({"tag": "direct", "protocol": "freedom", "settings": {}}) is None
 
     uris = "\n".join([
         "vless://u1@a.com:443?security=reality&pbk=k&sid=1#Berlin",
@@ -1189,6 +1368,36 @@ def _selftest():
         assert json.load(open(f"{d}/10-routing.json"))["dns"]["servers"][0]["domains"] \
             == ["domain:kept.example"]
 
+    # ---- export reads the confdir, which is what a prune leaves behind ---
+    with tempfile.TemporaryDirectory() as d:
+        write_pool(d, "de", [parse("vless://u1@a.com:443?security=tls&sni=a.com", "prox-de-1"),
+                             parse("ss://2022-blake3-aes-256-gcm:k@s.com:8388", "prox-de-2"),
+                             # the same node as prox-de-1, as a second
+                             # subscription would have delivered it
+                             parse("vless://u1@a.com:443?security=tls&sni=a.com", "prox-de-3"),
+                             {"tag": "prox-de-4", "protocol": "freedom", "settings": {}}], 0)
+        write_pool(d, "nl", [parse("trojan://pw@c.com:443", "prox-nl-1")], 0)
+        buf, old = io.StringIO(), sys.stderr
+        sys.stderr = buf
+        try:
+            got = export_uris(d)
+        finally:
+            sys.stderr = old
+        # deduped by node_id: the repeat carries a different tag and a
+        # different-looking URI, and is the same server either way
+        assert len(got) == 3, got
+        assert [u.split("://")[0] for u in got] == ["vless", "ss", "trojan"], got
+        assert all("prox-de-3" not in u for u in got), got
+        # ...and what could not be exported is named rather than dropped
+        assert "prox-de-4" in buf.getvalue(), buf.getvalue()
+        # --name is the pool, and the tag carries it into the export
+        assert export_uris(d, "nl") == [u for u in got if u.startswith("trojan")]
+        assert "prox-nl-1" in export_uris(d, "nl")[0]
+        # every exported URI must parse back into the outbound it came from
+        for uri in got:
+            assert parse(uri, "t") is not None, uri
+        assert export_uris(d, "no-such-pool") == []
+
     print("selftest ok")
 
 
@@ -1252,11 +1461,29 @@ if __name__ == "__main__":
                              "is given, concurrently, every interval, so this "
                              "is the lever that bounds that cost at the source.")
 
+    p_exp = sub.add_parser("export",
+                           help="print the pool's nodes back as URIs, on stdout")
+    p_exp.add_argument("--name", default=None, metavar="POOL",
+                       help="only this pool (default: every pool file)")
+    p_exp.add_argument("--base64", action="store_true",
+                       help="emit one base64 blob instead of a URI per line, "
+                            "which is the shape a client's 'add subscription' "
+                            "box expects")
+
     sub.add_parser("selftest", help="run the internal checks")
     args = ap.parse_args()
 
     if args.cmd == "selftest":
         _selftest()
+    elif args.cmd == "export":
+        # stdout is the list and stderr is the commentary, so a redirect to a
+        # file gets URIs and nothing else.
+        uris = export_uris(args.outdir, args.name)
+        if not uris:
+            sys.exit(f"no nodes to export from {args.outdir}/50-pool-*.json")
+        blob = "\n".join(uris)
+        print(base64.b64encode(blob.encode()).decode() if args.base64 else blob)
+        print(f"exported {len(uris)} node(s) from {args.outdir}", file=sys.stderr)
     elif args.cmd == "init":
         os.makedirs(args.outdir, exist_ok=True)
         domains = ensure_domains(args.domains

@@ -140,6 +140,7 @@ Started from elsewhere it would quietly create its own empty `conf/`.
 `init` writes what you then hand-edit and rarely touch, `pool` rewrites node files on every refresh.
 `pool` refuses to run if `10-routing.json` is missing rather than scaffolding it, which is the conflation the split exists to prevent.
 The two scaffold files are created only if missing; `--force` rewrites them and discards your edits.
+`export` is a third lifecycle and the only read-only one: it writes nothing to the confdir, so it is safe against a running service.
 
 **Re-running `pool` removes that pool's old chunk files first.**
 Otherwise a subscription that shrank from 200 nodes to 120 would leave chunks 07 to 10 behind, and `-confdir` would merge those dead nodes straight back in without a word.
@@ -364,6 +365,7 @@ And `timeout` only decides how long a failing probe occupies a socket, not how m
 ```sh
 ./alive.sh                    # report only
 ./alive.sh --prune            # delete the dead
+./alive.sh --prune && ./sub2xray.py export > working.txt   # ...and keep the survivors
 ALIVE_SINCE=-6h ./alive.sh --prune
 ./alive.sh selftest           # hermetic: stub journalctl, throwaway confdir
 ```
@@ -402,6 +404,35 @@ This exists for the scheduled path, which a report-only dry run cannot protect: 
 
 > With `fallbackTag: block`, an empty pool is a silent total outage rather than a leak.
 > Safe, but you are offline and nothing says so loudly.
+
+## Exporting the nodes that work
+
+The pool files are what xray is dialling, and `alive.sh --prune` deletes the dead ones from exactly those files.
+So after a prune, the confdir **is** the working set, and exporting it is a read:
+
+```sh
+ALIVE_SINCE=-5m sudo -E ./alive.sh --prune
+sudo -E ./sub2xray.py export > working.txt          # one URI per line
+sudo -E ./sub2xray.py export --base64 > working.txt # the shape a client's "add subscription" box wants
+sudo -E ./sub2xray.py export --name radikal_secure  # one pool only
+```
+
+The URI list goes to **stdout** and everything else to stderr, so the redirect gets URIs and nothing else.
+
+Nothing stores the original URIs - a subscription is refetched, not kept - so `export` rebuilds each one from the outbound, which is the exact inverse of what `pool` did on the way in.
+That is why it cannot drift: there is no second copy to fall out of step with the config, and the round-trip is pinned in the selftest by re-parsing every exported URI and comparing the outbound it produces.
+
+Two things do not survive the trip, because they never reached the confdir either:
+
+- **The node's display name.** The outbound's tag takes its place, which is more useful anyway: `#prox-radikal_secure-12` says which pool and which node.
+- **hysteria2's `sni=` and `insecure=`.** `parse_hysteria2` keeps address, port and password and nothing else, so a URI carrying them would claim more than xray was told.
+
+Nodes reached by two subscriptions are exported once.
+They parse into two tags and two different-looking URIs, and are the same server either way, so `export` dedupes on the same identity `alive.sh` uses: address, port and credential.
+An outbound with no URI form at all - a hand-added `freedom` in a `60-manual.json`, say - is **named on stderr** rather than dropped in silence, like every other skip in this tool.
+
+> The export is only as current as the last prune.
+> Report-only runs change nothing, so `./alive.sh` without `--prune` leaves the dead in the pool and therefore in the export.
 
 ## wireguard peers
 
