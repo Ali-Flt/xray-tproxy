@@ -27,7 +27,9 @@ cp config.ini.example config.ini && $EDITOR config.ini   # api_id, api_hash, bot
 docker compose up -d
 ```
 
-`api_id`/`api_hash` from [my.telegram.org](https://my.telegram.org), token from `@BotFather`. **Add the bot to the group before starting it** - it resolves `chat_id` once at startup and exits with the reason if it cannot.
+`api_id`/`api_hash` from [my.telegram.org](https://my.telegram.org), token from `@BotFather`. `chat_id` takes a channel, supergroup or group - all `-100…` except basic groups.
+
+**Add the bot before starting it.** For a channel that means *Manage channel -> Administrators -> Add admin*, leaving "Post Messages" on: a channel accepts posts only from admins, so a bot that is merely subscribed cannot publish. A group only needs the bot as a member. The id is resolved once at startup and the container exits with the reason if it cannot be.
 
 > **The checkout has to stay where it is.** `/usr/local/bin/xray-refresh` is a symlink into it, and `refresh.sh` finds `alive.sh` and `sub2xray.py` beside itself.
 
@@ -132,7 +134,7 @@ The reasoning lives next to the code, not here:
 | `sub2xray.py` | which subscription entries become outbounds, split DNS, the observatory |
 | `alive.sh` | how deadness is measured, and why a clean bill of health is suspicious |
 | `refresh.sh` | why the fetch runs as the `xray` user, and why every prune is followed by a restart |
-| `telegram/bot.py` | why it polls rather than watching, and why a bot cannot look its own group up |
+| `telegram/bot.py` | why it polls rather than watching, and why a bot cannot look its own channel up |
 
 This repo is the merge of two that were used together and kept drifting apart: the tproxy ruleset, units and installer from `xray-tproxy`, and the confdir generator, health check and wireguard tool from `xray-config`. Both histories are preserved.
 

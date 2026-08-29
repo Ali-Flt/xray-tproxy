@@ -7,13 +7,20 @@
 api_id =
 api_hash =
 
-# @BotFather -> /newbot. Then add the bot to the group; it needs no admin
-# rights to post, but if the group has "Restrict members" on, it does.
+# @BotFather -> /newbot.
+#
+# For a CHANNEL: Manage channel -> Administrators -> Add admin -> your bot,
+# and leave "Post Messages" on. A channel only accepts posts from admins, so
+# a bot that is merely subscribed cannot publish - it will say so in the log
+# rather than retrying in silence.
+#
+# For a GROUP: adding the bot is enough, unless the group restricts posting.
 bot_token =
 
-# The group. A supergroup looks like -1001234567890, a basic group like
-# -987654321. Forward any message from the group to @JsonDumpBot to read it,
-# or add @RawDataBot to the group for a moment.
+# A channel or supergroup looks like -1001234567890, a basic group like
+# -987654321; all three work. Forward any message from it to @JsonDumpBot to
+# read the id, or open the channel in web.telegram.org and take the number
+# from the url, prefixed with -100.
 chat_id =
 
 [watch]

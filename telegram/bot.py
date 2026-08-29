@@ -8,6 +8,12 @@ Written for refresh.sh's published node list, but it knows nothing about that
 file's format: it watches a path, and every time the bytes change it sends the
 file to one chat. Config in $TGPUSH_CONFIG, default /etc/tgpush/config.ini.
 
+A channel and a supergroup are the same thing to MTProto - both are peers of
+type channel, both have ids of the form -100<id> - so chat_id takes either.
+They differ in one way that matters: anyone may post in a group, while in a
+channel only an administrator with "Post Messages" can, which is why a bot is
+added to a channel by promoting it rather than by inviting it.
+
 ⚠ Whatever it sends is published to everyone in that group, and a node list is
   a list of credentials. Nothing here can un-send it.
 """
@@ -89,9 +95,10 @@ def write_state(path, value):
 def peer_kind(chat_id):
     """(kind, bare id) for a chat id. The sign and the -100 prefix are the type.
 
-    A supergroup or channel is marked -100<id>, a basic group is a bare
-    negative, a user is positive. Kept separate from to_peer so it can be
-    tested without telethon installed.
+    A supergroup or channel is marked -100<id> - they are one peer type and
+    need no distinguishing here - a basic group is a bare negative, and a user
+    is positive. Kept separate from to_peer so it can be tested without
+    telethon installed.
     """
     if chat_id > 0:
         return "user", chat_id
@@ -130,6 +137,7 @@ async def send(client, peer, cfg, body):
 
 async def watch(cfg, stop):
     from telethon import TelegramClient
+    from telethon.errors import ChatAdminRequiredError, ChatWriteForbiddenError
     client = TelegramClient(cfg["session"], cfg["api_id"], cfg["api_hash"])
     await client.start(bot_token=cfg["bot_token"])
     me = await client.get_me()
@@ -140,8 +148,9 @@ async def watch(cfg, stop):
         peer = await client.get_input_entity(to_peer(cfg["chat_id"]))
     except (ValueError, TypeError) as e:
         sys.exit(f"cannot resolve chat_id {cfg['chat_id']}: {e}\n"
-                 f"Check the id (a supergroup starts -100), and that @{me.username} "
-                 f"is a member of that group.")
+                 f"Check the id (a channel or supergroup starts -100), and that "
+                 f"@{me.username} has been added to it - as an administrator if "
+                 f"it is a channel.")
     log.info("connected as @%s, watching %s every %ss",
              me.username, cfg["path"], cfg["interval"])
     last = read_state(cfg["state"])
@@ -159,6 +168,15 @@ async def watch(cfg, stop):
                 write_state(cfg["state"], current)
                 last = current
                 log.info("sent %d node(s)", len(body.splitlines()))
+        except (ChatWriteForbiddenError, ChatAdminRequiredError):
+            # Never resolves on its own, so it gets the fix rather than a
+            # stack trace repeated every 30 seconds. Not fatal: promoting the
+            # bot takes effect immediately and the next check sends.
+            log.error("cannot post to %s. In a CHANNEL the bot must be an "
+                      "ADMINISTRATOR with 'Post Messages' - being a member is "
+                      "enough for a group but not for a channel. Promote "
+                      "@%s and the next check sends.",
+                      cfg["chat_id"], me.username)
         except Exception as e:          # one bad tick must not end the watch
             log.warning("tick failed, retrying in %ss: %s", cfg["interval"], e)
         # Polling, not inotify. refresh.sh publishes by renaming a temp file
