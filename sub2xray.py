@@ -740,7 +740,32 @@ def dns_conf(mode, domains):
     }
 
 
-def routing_conf(probe_interval, mode, domains):
+def strategy_conf(name):
+    """How the balancer picks, given the same observatory data.
+
+    leastPing ranks by average RTT and takes the single lowest, so every
+    connection rides ONE outbound until the next probe round changes its mind.
+    On a pool of free public nodes that is two problems at once: the node with
+    the best latency is the one everybody else's leastPing also chose, and when
+    it goes down everything stalls until a round has passed.
+
+    leastLoad ranks by the DEVIATION across the sampling window - steadiness
+    rather than speed - and then picks at random among the best `expected`. So
+    a node that is fast but erratic loses to one that is slower and reliable,
+    and the traffic is spread over several rather than piled onto one.
+
+    ⚠ Both read burstObservatory, which is what supplies a window of samples
+    instead of one number. leastLoad against the plain observatory degrades
+    silently, which is the other reason only one observatory is declared.
+    """
+    if name == "leastLoad":
+        # `expected` alone. baselines/maxRTT/costs also exist and are all ways
+        # to end up with a filter nothing passes, which reads as a dead pool.
+        return {"type": "leastLoad", "settings": {"expected": 3}}
+    return {"type": name}
+
+
+def routing_conf(probe_interval, mode, domains, strategy="leastPing"):
     """The one observatory. Xray allows exactly one, and it cannot be nested.
 
     burstObservatory, not the plain one. The plain observatory sleeps
@@ -793,7 +818,12 @@ def routing_conf(probe_interval, mode, domains):
                 "interval": probe_interval,
                 # window, not rate: probe rate stays nodes/interval either way.
                 # 3 samples ride out one unlucky timeout without going dead.
-                "sampling": 3,
+                # A window, not a rate - the probe rate stays nodes/interval
+                # whatever this is, so a wider one costs nothing. leastPing
+                # needs only the average and three is plenty; leastLoad reads
+                # the deviation, where three samples cannot tell a steady node
+                # from a lucky one.
+                "sampling": 5 if strategy == "leastLoad" else 3,
                 "timeout": "5s",
             },
         },
@@ -806,7 +836,7 @@ def routing_conf(probe_interval, mode, domains):
             # arbitrary node for a minute. It is also why dns-direct exists.
             "balancers": [{"tag": "lb", "selector": [TAG_PREFIX],
                            "fallbackTag": "block",
-                           "strategy": {"type": "leastPing"}}],
+                           "strategy": strategy_conf(strategy)}],
             # AsIs, not IPIfNonMatch. Under tproxy the destination IP is already
             # on the packet, so ip/geoip rules match without help; IPIfNonMatch
             # only adds a forward lookup per connection whose answer then gets a
@@ -1008,7 +1038,8 @@ def read_vless_id(path):
     return None
 
 
-def write_scaffold(outdir, probe_interval, mode, domains, inbound, force):
+def write_scaffold(outdir, probe_interval, mode, domains, inbound, force,
+                   strategy="leastPing"):
     """Create the hand-editable files, but never clobber edits by default."""
     inbound = dict(inbound)
     if inbound["vless"] and not inbound.get("vless_id"):
@@ -1016,7 +1047,8 @@ def write_scaffold(outdir, probe_interval, mode, domains, inbound, force):
                                or str(uuid.uuid4()))
     inbound.setdefault("vless_id", "")
     for name, conf in ((INBOUNDS, inbounds_conf(**inbound)),
-                       (ROUTING, routing_conf(probe_interval, mode, domains))):
+                       (ROUTING, routing_conf(probe_interval, mode, domains,
+                                              strategy))):
         path = os.path.join(outdir, name)
         if os.path.exists(path) and not force:
             print(f"kept   {path} (--force to rewrite)", file=sys.stderr)
@@ -1371,6 +1403,23 @@ def _selftest():
     assert sel["routing"]["rules"][-1]["outboundTag"] == "direct"
     assert full["routing"]["rules"][-1]["balancerTag"] == "lb"
     assert full["routing"]["rules"][-1]["network"] == "tcp,udp"
+    # ---- the balancer strategy ------------------------------------------
+    lp = routing_conf("3m", "full", ["x"])
+    ll = routing_conf("3m", "full", ["x"], "leastLoad")
+    assert lp["routing"]["balancers"][0]["strategy"] == {"type": "leastPing"}
+    assert ll["routing"]["balancers"][0]["strategy"]["type"] == "leastLoad"
+    assert ll["routing"]["balancers"][0]["strategy"]["settings"]["expected"] == 3
+    # ⚠ leastLoad reads the DEVIATION across the window, so three samples
+    # cannot tell a steady node from a lucky one. The window is not a rate -
+    # probes stay nodes/interval - so widening it for leastLoad costs nothing.
+    assert lp["burstObservatory"]["pingConfig"]["sampling"] == 3
+    assert ll["burstObservatory"]["pingConfig"]["sampling"] == 5
+    # ...and whichever it is, the fallback must stay: a strategy that can pick
+    # nobody has to blackhole rather than fall through to the first outbound.
+    for conf in (lp, ll):
+        assert conf["routing"]["balancers"][0]["fallbackTag"] == "block"
+    assert strategy_conf("random") == {"type": "random"}
+
     # ---- the observatory's cost is reported, and boundable ---------------
     assert interval_seconds("3m") == 180 and interval_seconds("90s") == 90
     assert interval_seconds("1h") == 3600
@@ -1496,6 +1545,12 @@ if __name__ == "__main__":
     p_init.add_argument("--vless-id", default="", metavar="UUID",
                         help="uuid for --vless-listen. Default: reuse the one "
                              "already in %s, or mint one on first use." % INBOUNDS)
+    p_init.add_argument("--strategy", default="leastPing",
+                        choices=("leastPing", "leastLoad", "random", "roundRobin"),
+                        help="how the balancer picks. leastPing (default) sends "
+                             "everything to the single lowest-latency node; "
+                             "leastLoad spreads it over the three steadiest, "
+                             "which suits a pool of free public nodes better.")
     p_init.add_argument("--probe-interval", default="3m",
                         help="observatory interval; probe rate is nodes/interval")
     p_init.add_argument("--tproxy-port", type=int, default=12345,
@@ -1575,7 +1630,8 @@ if __name__ == "__main__":
                         "vless": args.vless_listen,
                         "vless_id": args.vless_id,
                         "loglevel": args.loglevel,
-                        "access_log": args.access_log}, args.force)
+                        "access_log": args.access_log}, args.force,
+                       args.strategy)
         # Said out loud at the moment the config is written, not only in --help.
         # An open relay is found by scanners in days and the first symptom is
         # somebody else's traffic, which is a long way from this file. Narrowing

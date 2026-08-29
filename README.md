@@ -84,6 +84,7 @@ Every script has `--help` and a hermetic `selftest` that needs no service and no
 | flag | default | |
 |---|---|---|
 | `--mode` | `selective` | `selective`: only `domains.txt` + `geoip:telegram` exit via the pool. `full`: everything does |
+| `--strategy` | `leastPing` | `leastPing` sends everything to the single lowest-latency node; `leastLoad` spreads it over the three steadiest, which suits a pool of free public nodes better |
 | `--probe-interval` | `3m` | probe rate is nodes / interval, and the whole pool is dialled at once on restart |
 | `--proxy-listen` | `0.0.0.0` | the plain socks/http port. See the warning below |
 | `--loglevel` | `warning` | `error` and `none` leave `alive.sh` nothing to read; `debug` adds proof of life |
