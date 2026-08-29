@@ -136,6 +136,4 @@ The reasoning lives next to the code, not here:
 | `refresh.sh` | why the fetch runs as the `xray` user, and why every prune is followed by a restart |
 | `telegram/bot.py` | why it polls rather than watching, and why a bot cannot look its own channel up |
 
-This repo is the merge of two that were used together and kept drifting apart: the tproxy ruleset, units and installer from `xray-tproxy`, and the confdir generator, health check and wireguard tool from `xray-config`. Both histories are preserved.
-
-If you were running the old single-node `config.json`, `sub2xray.py pool` accepts a file with one URI in it. If you were running the old `conf/`, `init --force` rewrites the two scaffold files and leaves your pools alone - check the diff on `10-routing.json` first, the DNS design changed and rule order matters.
+Upgrading an existing confdir: `init --force` rewrites the two scaffold files and leaves your pools alone. Check the diff on `10-routing.json` first - rule order is load-bearing there.

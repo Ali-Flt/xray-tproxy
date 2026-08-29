@@ -754,9 +754,9 @@ def routing_conf(probe_interval, mode, domains):
     mode="full"       everything exits through the pool; direct is the exception.
     mode="selective"  the domain list exits through the pool; direct otherwise.
 
-    These were the two config*.json.example files in the tproxy repo. They are
-    one flag now, because they only ever differed in the last few rules and
-    keeping two whole configs in step by hand is how one of them rots.
+    One flag rather than two whole config files: they differ only in the last
+    few rules, and keeping two copies of everything else in step by hand is
+    how one of them rots.
     """
     proxy_rules = (
         [{"type": "field", "network": "tcp,udp", "balancerTag": "lb"}]
