@@ -754,13 +754,19 @@ def strategy_conf(name):
     a node that is fast but erratic loses to one that is slower and reliable,
     and the traffic is spread over several rather than piled onto one.
 
-    ⚠ Both read burstObservatory, which is what supplies a window of samples
-    instead of one number. leastLoad against the plain observatory degrades
-    silently, which is the other reason only one observatory is declared.
+    ⚠ Both "must be used together with an observatory" (xtls.github.io,
+    config/routing BalancerObject). random and roundRobin merely accept one.
+    This config declares burstObservatory, which satisfies that and is also
+    what supplies a window of samples rather than a single number.
     """
     if name == "leastLoad":
-        # `expected` alone. baselines/maxRTT/costs also exist and are all ways
-        # to end up with a filter nothing passes, which reads as a dead pool.
+        # `expected` - "the number of optimal nodes selected by the load
+        # balancer" - and nothing else. The other settings are all thresholds:
+        # maxRTT caps the acceptable RTT, baselines cap the acceptable standard
+        # deviation, tolerance caps the acceptable failure rate, costs weight
+        # individual tags. Every one of them is a way to end up with a filter
+        # that no node passes, which arrives looking like a dead pool rather
+        # than like a threshold set too tight.
         return {"type": "leastLoad", "settings": {"expected": 3}}
     return {"type": name}
 
