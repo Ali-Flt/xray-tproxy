@@ -16,7 +16,14 @@ TimeoutStartSec=45min
 # It rewrites the confdir and restarts the services, so it needs root - but
 # nothing beyond the two directories it owns.
 ReadWritePaths=/etc/xray /var/lib/xray
-ProtectHome=true
+
+# ⚠ read-only, NOT true. ExecStart is a symlink into the checkout, and with
+# ProtectHome=true systemd mounts an empty tmpfs over /home and /root - so a
+# checkout in either becomes invisible to this unit and the exec fails with
+# "Unable to locate executable: No such file or directory", naming a path that
+# is plainly there in a shell. read-only keeps the hardening and lets the unit
+# read the scripts wherever they live. Nothing here writes to a home directory.
+ProtectHome=read-only
 NoNewPrivileges=true
 
 [Install]

@@ -78,7 +78,13 @@ put systemd/xray-refresh.timer    /usr/lib/systemd/system/xray-refresh.timer
 # the repo stays the one place the scripts live - but it also has to stay where
 # it is, or the link dangles.
 ln -sfn "$PWD/refresh.sh" /usr/local/bin/xray-refresh
-echo "linked /usr/local/bin/xray-refresh -> $PWD/refresh.sh"
+# Verified, not assumed: a dangling link fails at the next timer firing with an
+# ENOENT naming a path that is plainly there, which is a poor way to find out.
+if [[ -x /usr/local/bin/xray-refresh ]]; then
+  echo "linked /usr/local/bin/xray-refresh -> $PWD/refresh.sh"
+else
+  echo "WARNING: /usr/local/bin/xray-refresh does not resolve to an executable" >&2
+fi
 install -d -m 0755 /var/lib/xray
 if [[ ! -e /etc/xray/subscriptions.txt ]]; then
   install -m 0644 subscriptions.txt.example /etc/xray/subscriptions.txt
