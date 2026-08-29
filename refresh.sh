@@ -234,7 +234,9 @@ publish() {
   # ⚠ Every line is a credential.
   chmod 0600 "$tmp"
   mv "$tmp" "$OUT"
-  say "published $(grep -c . "$OUT") node(s) to $OUT"
+  # "5 of 13" rather than "5": the pool and the export legitimately differ,
+  # because duplicates collapse, and a bare number invites the wrong question.
+  say "published $(grep -c . "$OUT") of $(pool_size) pool node(s) to $OUT"
 }
 
 # The selftest lives here rather than beside the script, like alive.sh's and

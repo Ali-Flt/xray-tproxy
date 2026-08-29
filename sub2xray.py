@@ -914,7 +914,7 @@ def export_uris(outdir, name=None):
     whoever imports this list would then probe it twice.
     """
     pattern = f"50-pool-{name}-*.json" if name else "50-pool-*.json"
-    uris, seen, unconvertible = [], set(), []
+    uris, seen, unconvertible, duplicates = [], {}, [], []
     for path in sorted(glob.glob(os.path.join(outdir, pattern))):
         try:
             with open(path) as f:
@@ -935,13 +935,23 @@ def export_uris(outdir, name=None):
                 continue
             ident = node_id(ob)
             if ident in seen:
+                duplicates.append(f"{ob.get('tag', '?')} is {seen[ident]}")
                 continue
-            seen.add(ident)
+            seen[ident] = ob.get("tag", "?")
             uris.append(uri)
     # Named, like every other skip in this file. A list that quietly comes back
-    # short is the failure mode the whole tool is written against.
+    # short is the failure mode the whole tool is written against - and the
+    # dedupe is the one that surprises, because the count can collapse without
+    # anything being wrong. Duplicates SHARE FATE through a prune: six tags for
+    # one server all answer or all fail together, so the survivors of a prune
+    # are far more duplicated than the subscription they came from.
     for why in unconvertible:
         print(f"not exported: {why}", file=sys.stderr)
+    if duplicates:
+        print(f"deduped {len(duplicates)} node(s) - same address, port and "
+              f"credential as one already exported:", file=sys.stderr)
+        for why in duplicates:
+            print(f"  {why}", file=sys.stderr)
     return uris
 
 
@@ -1386,6 +1396,10 @@ def _selftest():
         # deduped by node_id: the repeat carries a different tag and a
         # different-looking URI, and is the same server either way
         assert len(got) == 3, got
+        # ...and said out loud, naming BOTH tags: a count that collapses from
+        # 13 to 5 is alarming until you can see it was one server six times.
+        assert "deduped 1 node(s)" in buf.getvalue(), buf.getvalue()
+        assert "prox-de-3 is prox-de-1" in buf.getvalue(), buf.getvalue()
         assert [u.split("://")[0] for u in got] == ["vless", "ss", "trojan"], got
         assert all("prox-de-3" not in u for u in got), got
         # ...and what could not be exported is named rather than dropped
