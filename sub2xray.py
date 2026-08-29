@@ -282,6 +282,10 @@ def parse_ss(uri, tag):
     method, _, password = userinfo.partition(":")
     host, _, port = hostport.rpartition(":")
     method = method.strip().lower()
+    # Shadowsocks 2022 keys may be URL-encoded (%3A -> :, %2B -> +, etc.).
+    # Xray's client splits on ':' to get the per-user keys, so keep colons.
+    if method.startswith("2022-"):
+        password = unquote(password)
     if method not in SS_METHODS:
         raise ValueError(f"ss method {method!r} is not in xray-core")
     if not host or not port.isdigit():
@@ -820,6 +824,24 @@ def _selftest():
         assert o["streamSettings"] == {"sockopt": {"mark": FWMARK}}, u
         assert "security" not in o["streamSettings"], u
     assert parse(sip, "t")["settings"]["servers"][0]["method"] == "aes-256-gcm"
+    # 2022 ciphers with 4 base64 keys - colons separate the keys in both the
+    # URI and the JSON; Xray's client splits on ':' to get the per-user keys.
+    k1 = base64.b64encode(b"\x00" * 32).decode()   # 44 chars
+    k2 = base64.b64encode(b"\x01" * 32).decode()
+    k3 = base64.b64encode(b"\x02" * 32).decode()
+    k4 = base64.b64encode(b"\x03" * 32).decode()
+    uri_2022 = f"ss://2022-blake3-aes-256-gcm:{k1}:{k2}:{k3}:{k4}@x.com:443#four"
+    o2 = parse(uri_2022, "prox-2k")
+    assert o2["protocol"] == "shadowsocks"
+    assert o2["settings"]["servers"][0]["password"] == f"{k1}:{k2}:{k3}:{k4}"
+    # URL-encoded 2022 key: %3D -> =, %2F -> /, %2B -> +
+    ek1 = base64.b64encode(b"\x00\xff\x00\xff" * 8).decode()  # contains + and /
+    u1 = ek1.replace("+", "%2B").replace("/", "%2F").replace("=", "%3D")
+    uri_2022e = f"ss://2022-blake3-chacha20-poly1305:{u1}@x.com:443#enc"
+    o3 = parse(uri_2022e, "prox-enc")
+    assert o3["protocol"] == "shadowsocks"
+    pwd = o3["settings"]["servers"][0]["password"]
+    assert pwd == ek1, f"expected {ek1!r}, got {pwd!r}"
     # node_id must key on ss the same way it keys on vless, or nothing downstream
     # can identify one - it reads servers[0] rather than vnext[0]
     assert node_id(parse(sip, "t")) == "s.com:8388:sspw"
