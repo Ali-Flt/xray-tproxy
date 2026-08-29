@@ -124,6 +124,8 @@ That leaves port 22 alone. In `selective` mode it still goes direct, because ssh
 
 **`pool` and `export` drop repeated entries**, keyed on the whole outbound bar its tag - so one server offered over two transports stays two entries. Both say how many collapsed, which is why a settled pool of 13 can publish 5.
 
+**The bot reaches Telegram through the pool, not around it.** Its container sits on a docker bridge, prerouting captures it like everything else, and `geoip:telegram` routes to the balancer - which is what you want, since Telegram direct is usually the blocked path. But it means the publisher cannot connect while the pool is down, and every refresh cycle restarts xray underneath it. It retries with a backoff rather than exiting; `cannot reach Telegram` in its log points at the pool, not at the bot.
+
 **`/var/lib/xray/working.txt` is a list of credentials.** Written `0600`. Anything you forward it to is publishing them, Telegram included, and nothing can un-send that. `conf/`, `subs/`, `subscriptions.txt`, `working.txt` and `telegram/config.ini` are gitignored.
 
 ## Why it is built this way

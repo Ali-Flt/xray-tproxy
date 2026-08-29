@@ -135,11 +135,38 @@ async def send(client, peer, cfg, body):
         attributes=[DocumentAttributeFilename(cfg["filename"].format(**fields))])
 
 
+async def pause(stop, seconds):
+    """Sleep, but wake immediately on shutdown."""
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
 async def watch(cfg, stop):
     from telethon import TelegramClient
     from telethon.errors import ChatAdminRequiredError, ChatWriteForbiddenError
     client = TelegramClient(cfg["session"], cfg["api_id"], cfg["api_hash"])
-    await client.start(bot_token=cfg["bot_token"])
+    # ⚠ A failed connect is ordinary here, not exceptional. This container runs
+    # on the proxy host, its own traffic is captured like everything else, and
+    # geoip:telegram routes to the balancer - so it reaches Telegram THROUGH
+    # the pool it is publishing. Every refresh cycle restarts xray underneath
+    # it, and a pool that has not settled cannot carry the connection at all.
+    # Exiting on that hands a full traceback to Docker's restart policy once a
+    # minute, for a condition that resolves itself.
+    delay = cfg["interval"]
+    while not stop.is_set():
+        try:
+            await client.start(bot_token=cfg["bot_token"])
+            break
+        except Exception as e:
+            log.warning("cannot reach Telegram (%s: %s); retrying in %ss. This "
+                        "container's traffic goes out through the xray pool - "
+                        "check that it is up.", type(e).__name__, e, delay)
+            await pause(stop, delay)
+            delay = min(delay * 2, 300)     # backoff, capped at five minutes
+    if stop.is_set():
+        return
     me = await client.get_me()
     # Resolved once, at startup, rather than on the first change. A wrong id or
     # a bot that was never added to the group is otherwise a watcher that looks
@@ -182,10 +209,7 @@ async def watch(cfg, stop):
         # Polling, not inotify. refresh.sh publishes by renaming a temp file
         # over this path, which replaces the inode - an inotify watch on the
         # path follows the OLD inode and silently never fires again.
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=cfg["interval"])
-        except asyncio.TimeoutError:
-            pass
+        await pause(stop, cfg["interval"])
     await client.disconnect()
     log.info("stopped")
 
