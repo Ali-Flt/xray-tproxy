@@ -3,6 +3,7 @@
 #
 #   ./install.sh                 install units + ruleset, seed /etc/xray/conf
 #   ./install.sh --force-units   overwrite units and nftables.conf, keep conf/
+#   ./uninstall.sh               undo it; --purge takes the confdir too
 #
 # What it does NOT do is manage your nodes. The confdir is generated:
 #

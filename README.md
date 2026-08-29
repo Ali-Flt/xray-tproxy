@@ -31,6 +31,8 @@ docker compose up -d
 
 **Add the bot before starting it.** For a channel that means *Manage channel -> Administrators -> Add admin*, leaving "Post Messages" on: a channel accepts posts only from admins, so a bot that is merely subscribed cannot publish. A group only needs the bot as a member. The id is resolved once at startup and the container exits with the reason if it cannot be.
 
+To remove it: `sudo ./uninstall.sh` stops the services and unloads the capture, keeping your confdir and the published list. `--purge` deletes those and the `xray` user too. It tears the ruleset and the policy route down **before** deleting the units, and stops with them intact if that did not work - their `ExecStop` is the only other thing that can unload the capture, and a half-removed one leaves the host with no network.
+
 > **The checkout has to stay where it is.** `/usr/local/bin/xray-refresh` is a symlink into it, and `refresh.sh` finds `alive.sh` and `sub2xray.py` beside itself.
 
 ## What the timer does
