@@ -1,30 +1,95 @@
 # xray-tproxy
 
-A transparent proxy for a host or a LAN.
-nftables captures traffic and hands it to one xray, which sends it out through a pool of subscription nodes behind a latency-picked balancer.
+A transparent proxy for a host or a LAN. nftables captures traffic and hands it to one xray, which sends it out through a pool of subscription nodes behind a latency-picked balancer. A timer refreshes that pool, prunes whatever stops answering, and publishes the survivors; a container posts the list to Telegram when it changes.
 
-This repo is the merge of two that were being used together and kept drifting apart:
-the tproxy ruleset, systemd units and installer from `xray-tproxy`, and the confdir generator, health check and wireguard peer tool from `xray-config`.
-Both histories are preserved here.
+## Setup
 
 ```sh
-sudo ./install.sh                                              # user, dirs, units, ruleset
+sudo ./install.sh                              # user, dirs, units, ruleset
 export XRAY_CONFDIR=/etc/xray/conf
-sudo -E ./sub2xray.py init                                     # once, hand-edit after
-sudo -E ./sub2xray.py pool --name main --size 20 sub.txt       # every refresh
-sudo ./install.sh                                              # validates, then starts both
+sudo -E ./sub2xray.py init                     # inbounds + routing, once
+sudoedit /etc/xray/conf/domains.txt            # what gets proxied; init --force to apply
+
+sudoedit /etc/xray/subscriptions.txt           # "<pool-name> <url>", one per line
+sudo REFRESH_QUIET=60 REFRESH_MAX=300 /usr/local/bin/xray-refresh   # first cycle, shortened
+
+sudo ./install.sh                              # validates the confdir, enables both services
+sudo systemctl enable --now xray-refresh.timer # every 30 min from here
 ```
 
-`install.sh` is idempotent, and the second run is not a typo.
-The first has no config to check yet, so it installs the pieces and starts nothing.
-The second finds the confdir, runs `xray -test` against it, and only then enables `xray` and `xray-nftables`.
+The second `install.sh` is not a typo: the first had no config to check, the second runs `xray -test` against it and only then starts anything.
 
-**Both services, and the second one will not follow the first.**
-`xray-nftables` is `PartOf=xray.service`, which propagates *stop and restart* but not *start*.
-Bringing up xray on its own therefore leaves the ruleset unloaded, and that failure is silent: nothing is captured, everything reaches the internet directly, and no log anywhere says the proxy is not in the path.
-If you would rather do it by hand, the command is `systemctl enable --now xray xray-nftables`, not `restart xray`.
+Then the Telegram publisher:
 
-To confirm the capture is actually in the path, rather than merely that xray is running:
+```sh
+cd telegram
+cp config.ini.example config.ini && $EDITOR config.ini   # api_id, api_hash, bot_token, chat_id
+docker compose up -d
+```
+
+`api_id`/`api_hash` from [my.telegram.org](https://my.telegram.org), token from `@BotFather`. **Add the bot to the group before starting it** - it resolves `chat_id` once at startup and exits with the reason if it cannot.
+
+> **The checkout has to stay where it is.** `/usr/local/bin/xray-refresh` is a symlink into it, and `refresh.sh` finds `alive.sh` and `sub2xray.py` beside itself.
+
+## What the timer does
+
+Every 30 minutes, measured from when the last cycle **finished**:
+
+1. fetch each subscription as the `xray` user, so the fetch is not captured and cannot be blackholed by the dead pool it is replacing. A failed fetch is retried through the proxy, then leaves the pool on disk alone
+2. `xray -test`, then restart `xray` and `xray-nftables`
+3. every 30s, `alive.sh --prune`; if it deleted anything, restart and reset the clock. Settled when nothing has failed for 5 minutes
+4. export the survivors to `/var/lib/xray/working.txt`
+
+Nothing is published unless step 3 settles - a list already known to be dead is worse than yesterday's. A cycle that never goes quiet exits non-zero and leaves the file alone.
+
+```sh
+journalctl -fu xray-refresh
+systemctl list-timers xray-refresh
+```
+
+## Day to day
+
+```sh
+sudo systemctl restart xray                 # PartOf restarts the ruleset with it
+sudo -E ./alive.sh                          # what is failing, report only
+sudo -E ./alive.sh --prune                  # ...and delete it
+sudo -E ./sub2xray.py export                # the pool, back as URIs, on stdout
+sudo -E ./sub2xray.py pool --name x sub.txt # add a pool by hand
+WG_ENDPOINT=vpn.example:51820 ./wg-peer.sh add phone   # wireguard peer + QR
+```
+
+Every script has `--help` and a hermetic `selftest` that needs no service and no network.
+
+## Files
+
+| path | owner | holds |
+|---|---|---|
+| `/etc/xray/conf/00-inbounds.json` | `sub2xray init` | tproxy door, socks/http port, `log` |
+| `/etc/xray/conf/10-routing.json` | `sub2xray init` | dns, outbounds, observatory, balancer, rules |
+| `/etc/xray/conf/05-wireguard.json` | `wg-peer` | wireguard inbound: server key + peers |
+| `/etc/xray/conf/50-pool-<name>-NN.json` | `sub2xray pool` | one subscription's outbounds, chunked |
+| `/etc/xray/conf/domains.txt` | **you** | what is proxied, one matcher per line |
+| `/etc/xray/subscriptions.txt` | **you** | `<pool-name> <url>` per line |
+| `/etc/xray/nftables.conf` | `install.sh` | the capture ruleset |
+| `/var/lib/xray/working.txt` | `refresh.sh` | the last settled export |
+
+## Configuration
+
+`sub2xray.py init --help` for the rest; these are the ones worth knowing.
+
+| flag | default | |
+|---|---|---|
+| `--mode` | `selective` | `selective`: only `domains.txt` + `geoip:telegram` exit via the pool. `full`: everything does |
+| `--probe-interval` | `3m` | probe rate is nodes / interval, and the whole pool is dialled at once on restart |
+| `--proxy-listen` | `0.0.0.0` | the plain socks/http port. See the warning below |
+| `--loglevel` | `warning` | `error` and `none` leave `alive.sh` nothing to read; `debug` adds proof of life |
+| `--access-log` | `none` | not affected by `--loglevel`; unset means stdout, which journald keeps |
+
+`refresh.sh --help` lists its environment: `REFRESH_QUIET`, `REFRESH_EVERY`, `REFRESH_MAX`, `REFRESH_LIMIT`, `REFRESH_SIZE`, `REFRESH_FETCH_USER`, `REFRESH_OUT`, `ALIVE_MIN`.
+
+## Gotchas
+
+**Both services, and the second will not follow the first.** `xray-nftables` is `PartOf=xray.service`, which propagates stop and restart but **not start**. Starting xray alone leaves the ruleset unloaded and nothing says so: nothing is captured and everything reaches the internet directly. Use `systemctl enable --now xray xray-nftables`.
 
 ```sh
 systemctl is-active xray xray-nftables   # both must say active
@@ -32,63 +97,9 @@ sudo nft list table ip xray | head       # the ruleset is loaded
 ip rule show | grep 'fwmark 0x1'         # the policy route exists
 ```
 
-All three, because the first passing on its own is the silent case above.
+**Logging must stay on stdout.** Point `log.access`/`log.error` at files and journald goes quiet, so `alive.sh` reports a pool in which nothing has ever failed - the one outcome it cannot tell apart from a broken grep.
 
-Once both are up, a pool refresh is just:
-
-```sh
-sudo -E ./sub2xray.py pool --name main --size 20 sub.txt
-sudo systemctl restart xray        # PartOf reloads the ruleset with it
-```
-
-## The loop, and the two rules that stop it
-
-This is the failure mode that makes a tproxy setup unusable, and it is worth understanding before changing anything.
-
-nftables marks captured packets and sends them to xray.
-xray then dials a node, and **that dial is a packet leaving this host too**.
-Nothing distinguishes it from traffic you meant to capture, so it is captured, handed back to xray, and dispatched a second time.
-
-For a plain proxy dial that only wastes a round trip.
-For DNS it is fatal: the resolver's own upstream query gets fed back to the DNS module, which then answers its own lookups out of its own cache.
-The log fills with `cache HIT ... empty response`, every name takes seconds, and no query ever reaches an upstream at all.
-
-Two independent rules prevent it, and both are here on purpose:
-
-| where | rule | covers |
-|---|---|---|
-| `nftables.conf`, output chain | `meta skuid xray return` | everything xray sends, whatever the protocol does |
-| every outbound in the confdir | `streamSettings.sockopt.mark = 2` | matched by `meta mark 2 return` |
-
-The uid rule is the load-bearing one.
-The mark only works for protocols whose dialer honours `sockopt`, and it is one forgotten field away from being absent.
-That is exactly how this broke: `parse_ss` emitted shadowsocks outbounds with no `streamSettings` at all, on the reasoning that an empty TLS block would make xray negotiate TLS on a raw TCP protocol.
-True about TLS, but it took the fwmark with it, and public pools are mostly shadowsocks.
-Hysteria had the same hole.
-`sub2xray.py selftest` now asserts the mark over every outbound it emits rather than per protocol, because per-protocol is how the second one was missed.
-
-> nftables resolves `meta skuid xray` to a numeric uid at parse time.
-> The ruleset will not load if the `xray` user does not exist yet, which is why `install.sh` creates it first.
-
-## Ports that stay direct
-
-`KEEP_DIRECT_PORTS` in `nftables.conf` is `{ 22, 2080, 8585 }`, and those ports bypass the proxy **in both directions**.
-
-The two directions exist for different reasons, and the second one is not optional:
-
-- **Inbound.** A connection arriving on a public interface matches neither `RESERVED_IP` nor `192.168.0.0/16`, so without the exemption it is TPROXY'd into the transparent door instead of reaching the listener it was addressed to.
-- **Outbound.** A connection this host *makes* to one of these ports must not be marked either.
-
-> ⚠ The invariant is: **whatever `prerouting` will not TPROXY, `output` must not mark.**
-> Break it and you get a black hole, not a fallback.
-> A marked packet is routed to `lo` by the `fwmark 1` rule and comes back round to `prerouting`, which then declines to TPROXY it - but the decision to deliver it locally has already been made, and nothing is listening for the remote address.
-> The packet is dropped, with no log line anywhere.
-> `git pull` over ssh hitting `Connection timed out` after ~2 minutes is what that looks like.
-
-Adding a port to the set covers both directions at once, which is why it is one define rather than two.
-Taking `22` out to get outgoing ssh proxied would also stop protecting inbound ssh, which is a good way to lock yourself out of a remote box.
-
-If you want github over ssh to go through the pool rather than direct, do it in ssh rather than in nftables:
+**Ports 22, 2080 and 8585 stay direct, both ways.** `KEEP_DIRECT_PORTS` in `nftables.conf`. Whatever `prerouting` will not tproxy, `output` must not mark, or the packet is routed to `lo`, refused, and silently dropped - `git pull` over ssh timing out after two minutes is what that looks like. To put github ssh through the pool, do it in ssh, not nftables:
 
 ```
 # ~/.ssh/config
@@ -97,524 +108,32 @@ Host github.com
   Port 443
 ```
 
-GitHub serves ssh on 443, which is not in the set and is routed like any other traffic.
+That leaves port 22 alone. In `selective` mode it still goes direct, because ssh-on-443 is not TLS and no `domain:` rule can match it; use the HTTPS remote if you want github on the pool.
 
-## What install.sh puts where
+**The socks/http port is `auth: noauth` on `0.0.0.0`.** An open proxy to anything that can route here. Firewall it, or narrow it with `--proxy-listen`.
 
-| repo file | installed to |
+**`geosite:`/`geoip:` rules need the `.dat` files**, and a missing or misspelled one is a hard startup failure. `xray.service` sets `XRAY_LOCATION_ASSET=/usr/share/xray`; Debian and the official installer use `/usr/local/share/xray`.
+
+**An empty pool is a silent total outage.** `fallbackTag` is `block`, so when the balancer can pick nobody, traffic is blackholed rather than leaking. `ALIVE_MIN` (default 1) refuses a prune that would leave fewer than N.
+
+**Probe cost is the whole pool, every interval, concurrently, with no backoff.** Past ~200 outbounds the balancer stops converging and looks like it is full of bad nodes. `sub2xray.py` prints the arithmetic when you cross it; cut it with `REFRESH_LIMIT`, `alive.sh --prune`, or a longer `--probe-interval`.
+
+**`pool` and `export` drop repeated entries**, keyed on the whole outbound bar its tag - so one server offered over two transports stays two entries. Both say how many collapsed, which is why a settled pool of 13 can publish 5.
+
+**`/var/lib/xray/working.txt` is a list of credentials.** Written `0600`. Anything you forward it to is publishing them, Telegram included, and nothing can un-send that. `conf/`, `subs/`, `subscriptions.txt`, `working.txt` and `telegram/config.ini` are gitignored.
+
+## Why it is built this way
+
+The reasoning lives next to the code, not here:
+
+| file | explains |
 |---|---|
-| `nftables.conf` | `/etc/xray/nftables.conf` |
-| `systemd/xray.service` | `/usr/lib/systemd/system/xray.service` |
-| `systemd/xray-nftables.service` | `/usr/lib/systemd/system/xray-nftables.service` |
-| `conf/*.json` and `conf/domains.txt`, if present | `/etc/xray/conf/` |
-
-Both are namespaced on purpose.
-A unit called `nftables.service` overwrites the one the distro's nftables package ships, and `/etc/nftables.conf` is that package's config file.
-Installing over both means a package update silently reverts the capture, or the distro's own ruleset flushes this one.
-
-`install.sh` refuses to overwrite a populated `/etc/xray/conf`, because that is where your pools and your hand-edited routing live.
-It re-installs the units and the ruleset with `--force-units`.
-It validates the config with `xray -test` before enabling anything: starting the capture with a config xray will not load is how a transparent proxy takes the whole host offline, since the ruleset happily tproxies every packet at a port with nothing behind it.
-
-The tools themselves are not installed.
-Run `sub2xray.py`, `alive.sh` and `wg-peer.sh` from the clone, with `XRAY_CONFDIR=/etc/xray/conf`.
-
-## Layout
-
-| file | owner | holds |
-|---|---|---|
-| `00-inbounds.json` | `sub2xray init` | the tproxy door, a plain socks/http port, `log` |
-| `05-wireguard.json` | `wg-peer` | the wireguard inbound: server key + peers |
-| `10-routing.json` | `sub2xray init` | dns, outbounds, observatory, the `lb` balancer, the rules |
-| `50-pool-<name>-NN.json` | `sub2xray pool` | outbounds for one subscription, chunked |
-| `domains.txt` | **you** | which destinations are proxied, one matcher per line |
-| `/etc/xray/subscriptions.txt` | **you** | `<pool-name> <url>` per line, read by `refresh.sh` |
-| `/var/lib/xray/working.txt` | `refresh.sh` | the last settled export, republished on every cycle |
-
-All inside `$XRAY_CONFDIR`, default `conf` in the current directory, `/etc/xray/conf` once installed.
-`sub2xray --outdir` and `wg-peer`'s `XRAY_CONF` override individually.
-
-**`XRAY_CONFDIR` is relative, so it follows your shell.**
-A systemd unit needs `WorkingDirectory=` or an absolute path.
-Started from elsewhere it would quietly create its own empty `conf/`.
-
-**`init` and `pool` are separate commands because they have different lifecycles.**
-`init` writes what you then hand-edit and rarely touch, `pool` rewrites node files on every refresh.
-`pool` refuses to run if `10-routing.json` is missing rather than scaffolding it, which is the conflation the split exists to prevent.
-The two scaffold files are created only if missing; `--force` rewrites them and discards your edits.
-`export` is a third lifecycle and the only read-only one: it writes nothing to the confdir, so it is safe against a running service.
-
-**Re-running `pool` removes that pool's old chunk files first.**
-Otherwise a subscription that shrank from 200 nodes to 120 would leave chunks 07 to 10 behind, and `-confdir` would merge those dead nodes straight back in without a word.
-
-## Selective or full
-
-`sub2xray init --mode` replaces the two `config*.json.example` files the tproxy repo used to carry.
-They only ever differed in the last few routing rules, and keeping two whole configs in step by hand is how one of them rots.
-
-| mode | catch-all | proxied |
-|---|---|---|
-| `selective` (default) | `direct` | `DOMAIN_LIST` and `geoip:telegram` |
-| `full` | the `lb` balancer | everything |
-
-Edit `$XRAY_CONFDIR/domains.txt` and re-run `init --force` to apply it.
-The same list scopes the proxied DNS server, so the two cannot disagree about what is proxied.
-See [the domain list](#the-domain-list).
-
-In both modes, ads are blackholed, `geoip:private` and bittorrent go direct, and udp/443 is blocked.
-Blocking QUIC makes browsers fall back to TCP TLS, which these proxies can actually carry.
-It has to sit above the proxy rules: below them the proxied domains are exactly the QUIC-heavy ones, and their udp/443 would be handed to a balancer that cannot carry it.
-
-Torrents going direct is deliberate.
-These are free public nodes shared by strangers, a swarm opens hundreds of connections a second, and it would be both useless over them and abusive to them.
-
-## The domain list
-
-`domains.txt` is an **input**, not a generated file.
-`init` seeds it from a built-in default the first time and never writes it again, so `--force` regenerates the two JSON files *from* it rather than resetting it.
-That is the whole point of the split: without it, the edit-then-apply flow would reset the very list it was applying.
-
-```
-# One matcher per line. Blank lines and # comments are ignored.
-domain:example.com    # the domain and its subdomains
-full:example.com      # that name exactly
-geosite:netflix       # a named set from the geosite data
-keyword:exampl        # substring match
-regexp:^ex.*[.]com$   # a regular expression
-```
-
-A `#` only starts a comment at the start of a line or after whitespace, so a `regexp:` entry containing one survives.
-Duplicates and surrounding whitespace are dropped, which is what makes pasting into it safe.
-
-The seed is deliberately small: nine `geosite:` sets, not a page of hostnames.
-A geosite set is maintained upstream and follows the service when it changes domains, so it stays right without you.
-Add whatever else you need.
-
-> An unknown **prefix** is not an error to xray.
-> `geosit:netflix` is matched as the literal string `geosit:netflix`, which nothing is ever equal to.
-> A typo is therefore a rule that silently never fires, so the reader names the line and the prefix on stderr and carries on.
->
-> An unknown **geosite name** is the opposite: `geosite:netflx` is a hard startup failure, xray refuses to load the config at all, and the service does not come up.
-> Check a new one with `xray -test -confdir <confdir>` before restarting.
-
-`--domains PATH` points somewhere else.
-An empty list is refused in `selective` mode, where it would leave the pool carrying nothing but `geoip:telegram`.
-
-## DNS
-
-Split, and the split is the point.
-
-| server | tag | routed | resolves |
-|---|---|---|---|
-| `https://1.1.1.1/dns-query` | `dns-proxied` | the `lb` balancer | `DOMAIN_LIST` in selective mode, everything in full |
-| `https://8.8.8.8/dns-query` | `dns-direct` | `direct` | the rest |
-
-A DNS server's `tag` becomes the **inbound tag** of the queries that server emits.
-That is the whole mechanism, and it is what lets a routing rule say where a lookup travels rather than only where it is sent.
-
-> The rules that read those tags need `"type": "field"`.
-> Without it the rule is not a field rule and never matches.
-> It is a silent no-op: the tag looks wired up and the queries go out the catch-all.
-
-Resolving proxied names at the exit is not only about poisoning.
-It is where the answer should come from.
-Resolve a CDN name locally and you get the IP that is optimal for here, then reach it down a tunnel that surfaces somewhere else.
-
-**DoH on both, and that is what makes the fallback safe.**
-If the proxied lookup cannot complete, which is the window after a restart while the observatory has probed nobody and `fallbackTag` is blackholing, xray falls through to the next server.
-Falling through to a plaintext resolver is how a censored name gets a forged answer that is then cached, after which even a working node dials the block address.
-Falling through to another DoH server costs a geographically wrong answer and nothing else, so the fallback is left on.
-Refusing to resolve at all would deadlock the pool it is waiting for.
-
-**Never `udp://` or `tcp://`.**
-On a network that injects DNS answers a plain resolver is not a resolver, and using a public one instead is not the fix.
-`8.8.4.4` returns the block address too, because the injection happens in transit rather than at the server.
-Over HTTPS a forged answer fails the certificate check.
-`tcp://` has a second problem: the stream is framed by a 2-byte length prefix, so anything that answers port 53 with something else corrupts it beyond recovery, and an HTTP reply reads as an 18516-byte message.
-
-`queryStrategy: UseIPv4`, because otherwise every name is asked twice and the empty AAAA half is retried against every server in turn.
-
-**The DNS rules must stay first in the rule list.**
-Below the port-53 rule, a resolver's own query matches that rule and is handed back to `dns-out`, which is the loop again by a different route.
-
-## Which subscription entries become outbounds
-
-| scheme | result |
-|---|---|
-| `vless://` `vmess://` `trojan://` | outbound |
-| `ss://` | outbound, SIP002 (base64 or plain userinfo) and the legacy all-in-one-blob form |
-| `hysteria2://` `hy2://` | outbound, registered as protocol `hysteria` with `version: 2`; there is **no** `hysteria2` config id |
-| `hysteria://` `hy://` | **skipped**, that outbound only speaks version 2 and v1 is dead upstream |
-| `ss://` with a legacy cipher or `?plugin=` | **skipped**, xray dropped the stream ciphers and plugins are separate processes it cannot host |
-
-**Repeats are dropped, and distinct configurations are not.**
-`pool` deduplicates before `--limit` applies, so the budget buys distinct nodes rather than clones and the observatory does not probe one server six times.
-The key is the whole outbound bar its tag, **not** the server: the same host and credential offered over two transports, or under two SNIs, is two configurations of which only one may work, and nothing has probed either yet.
-Measured against a 1033-entry subscription: 56 exact repeats, and a further 51 that were the same server configured differently. Keying on the server would have thrown those 51 away unprobed.
-
-```
-deduped 56 repeated node(s); 977 distinct
---limit: keeping 150 of 977 nodes in pool 'radikal_secure'; the rest are not written
-```
-
-A duplicate is counted rather than named, which is not the inconsistency it looks like next to the rule below: a skip is a node you asked for and cannot have, so it needs a name and a reason. A duplicate is the same node twice, and nothing is lost.
-
-**Every skip is counted and named on stderr**, per scheme, with the node's `host:port` and the reason.
-
-```
-skipped 1 hysteria2 node(s):
-  h.example:443 - no hysteria2 outbound exists in xray-core
-```
-
-This is the point, not decoration.
-A subscription that silently halves is indistinguishable from one full of dead nodes, and `alive.sh`'s counts would then be measured against a pool that lost members without saying so.
-One malformed entry is skipped the same way and never aborts the batch.
-
-> **A hysteria outbound with no `address` panics xray on load.**
-> It does not fail `-test`, it takes the process down.
-> Verified on 26.3.27, so the parser validates host and port before emitting one.
-
-Shadowsocks outbounds carry `settings.servers[0]` rather than `vnext[0]`, and `streamSettings` containing **only** `sockopt`.
-No `network` and no `security`, so xray keeps its raw TCP defaults.
-`alive.sh` reads both shapes.
-
-**`conf/` and `subs/` are gitignored.**
-Pool files carry uuids, passwords and reality keys, and a subscription file is the same credentials in URI form, often the account itself.
-
-## Turning the logging down
-
-xray writes two logs, and `loglevel` only governs one of them.
-
-| log | controlled by | carries |
-|---|---|---|
-| error | `--loglevel` | startup, dial failures, and the observatory verdicts `alive.sh` reads |
-| access | `--access-log` | one line per connection, plus one per DNS cache hit |
-
-The access log is the volume.
-It is not levelled, so `--loglevel error` does not quiet it by a single line, and left unset xray sends it to stdout where journald keeps all of it.
-It is `none` here by default, which is off.
-
-```sh
-sudo -E ./sub2xray.py init --force --loglevel warning   # the default
-sudo systemctl restart xray
-```
-
-| `--loglevel` | journal volume | what `alive.sh` can still do |
-|---|---|---|
-| `debug` | very high | full: reports who failed *and* who answered |
-| `warning` (default) | low | prune: reports who failed |
-| `error` | near silent | nothing, the observatory logs its failures at warning |
-| `none` | silent | nothing |
-
-So `warning` is the floor if you want `alive.sh` to keep working, and `debug` is worth turning on only for the window in which you are actually pruning.
-
-`dnsLog` is left off. Turning it on adds a line per lookup per server, which with a fallback list is several lines per name.
-
-If the remaining volume is still too much, cap it on the journald side rather than blinding the tools:
-
-```sh
-sudo journalctl --vacuum-size=200M
-sudo systemctl edit xray        # [Service] LogRateLimitIntervalSec=30s
-                                #           LogRateLimitBurst=1000
-```
-
-To silence it completely, `--loglevel none --access-log none`, or `StandardOutput=null` in the unit.
-Both leave `alive.sh` with nothing to read, and leave you with no record of why a node stopped working.
-
-## Sizing the pool
-
-`burstObservatory` probes **every** subject **concurrently**, every `interval`, and never backs off.
-A node that has been dead for a week is dialled again every round, forever.
-So the cost is `nodes / interval` sustained, plus a burst the width of the whole pool every time xray restarts.
-
-At 2000 nodes and the default `3m` that is 11 probes/sec and 2000 simultaneous dials on startup.
-The failure is indirect and easy to misread: probes start timing out under their own weight, `leastPing` never gets a clean round, and the balancer looks like it is full of bad nodes rather than holding too many of them.
-
-`pool` now reports the arithmetic whenever the total passes 200:
-
-```
-800 nodes in pool 'main' across 16 file(s)
-
-warning: 800 outbounds now match the observatory selector 'prox'.
-  At interval 3m that is 4.4 probes/sec sustained, and 800 concurrent dials every time xray restarts.
-```
-
-Three levers, best first:
-
-**1. Take fewer nodes.** The lever at the source, and the only one that also shrinks the startup burst:
-
-```sh
-./sub2xray.py pool --name main --limit 150 sub.txt
-```
-
-It says what it dropped rather than quietly keeping the first N.
-
-**2. Prune what is already dead.** Measured rather than guessed, so it removes nodes you were paying to probe and could never have used:
-
-```sh
-./sub2xray.py init --force --loglevel debug && sudo systemctl restart xray
-sleep 900
-./alive.sh --prune && sudo systemctl restart xray
-./sub2xray.py init --force --loglevel warning   # put the log back down
-```
-
-**3. Slow the rounds down.** Cheapest to apply, but it does not touch the startup burst - the whole pool is still dialled at once when xray starts:
-
-```sh
-./sub2xray.py init --force --probe-interval 20m
-```
-
-Roughly one probe per second is a reasonable target, so `interval` in seconds around the node count.
-
-> A subscription is not a pool.
-> Feeding a 2000-entry subscription straight in gives you 2000 nodes of which a few dozen work, and the observatory pays full price for all of them on every round.
-> `--limit` plus a periodic `--prune` keeps the working set roughly the size of what actually works.
-
-Two things that look like levers and are not.
-`sampling` is the width of the moving average, not a rate: changing it does not alter how often anything is dialled.
-And `timeout` only decides how long a failing probe occupies a socket, not how many are opened.
-
-## Which of my nodes are alive?
-
-```sh
-./alive.sh                    # report only
-./alive.sh --prune            # delete the dead
-./alive.sh --prune && ./sub2xray.py export > working.txt   # ...and keep the survivors
-ALIVE_SINCE=-6h ./alive.sh --prune
-./alive.sh selftest           # hermetic: stub journalctl, throwaway confdir
-```
-
-It reads `journalctl --system -u xray.service --since -1h` and nothing else.
-The service is already probing every node continuously, so there is no second xray and no duplicate probe traffic, and the window widens with time rather than patience.
-
-> **This works only while xray logs to stdout**, which is what makes journald the log.
-> Point `log.access`/`log.error` at files and journalctl goes quiet, so every run reports a pool in which nothing has ever failed.
-> That is the one outcome the tool cannot tell apart from a broken grep, so it says so rather than letting it read as good news.
-
-Two lines matter, and they sit at different log levels:
-
-```
-[Warning] app/observatory/burst: error ping https://.../generate_204 with prox-main-105: ...
-[Debug]   app/observatory/burst: burst: checking prox-main-105
-```
-
-So at the default `warning` you get every failure and no proof of life.
-The dead list is measured; alive at that level only ever means *not reported failing*, and the summary says exactly that rather than claiming more.
-`sub2xray.py init --force --loglevel debug` makes it report who actually answered.
-
-> **Never grep `the outbound X is dead`.**
-> That is the plain observatory's message.
-> `burstObservatory` never emits it, so grepping for it reports a perfect pool, silently.
-
-`--prune` deletes the dead outbound from its pool file.
-Nothing is kept, deliberately: the subscriptions are the source, so regenerating from them is the recovery.
-The delete is per-file `mktemp`+`mv`, so a crash cannot leave a half-written pool.
-The replacement is given the original's mode and owner before the rename, because `mktemp` creates `0600` and `mv` carries the *source's* metadata onto the destination: without that step a prune leaves the pool file `rw-------` and, under `sudo`, owned by root, after which xray cannot read its own config and says so only at the next restart.
-The running service keeps its old config until you restart it.
-
-**`ALIVE_MIN` (default 1) refuses a prune that would leave fewer than N nodes**, and says so on stdout with the exact override to type.
-Everything failing at once is nearly always your uplink, DNS or the probe destination, not 300 unrelated servers dying together.
-This exists for the scheduled path, which a report-only dry run cannot protect: a cron job passes `--prune` by definition and nobody reads its output.
-
-> With `fallbackTag: block`, an empty pool is a silent total outage rather than a leak.
-> Safe, but you are offline and nothing says so loudly.
-
-## Exporting the nodes that work
-
-The pool files are what xray is dialling, and `alive.sh --prune` deletes the dead ones from exactly those files.
-So after a prune, the confdir **is** the working set, and exporting it is a read:
-
-```sh
-ALIVE_SINCE=-5m sudo -E ./alive.sh --prune
-sudo -E ./sub2xray.py export > working.txt          # one URI per line
-sudo -E ./sub2xray.py export --base64 > working.txt # the shape a client's "add subscription" box wants
-sudo -E ./sub2xray.py export --name radikal_secure  # one pool only
-```
-
-The URI list goes to **stdout** and everything else to stderr, so the redirect gets URIs and nothing else.
-
-Nothing stores the original URIs - a subscription is refetched, not kept - so `export` rebuilds each one from the outbound, which is the exact inverse of what `pool` did on the way in.
-That is why it cannot drift: there is no second copy to fall out of step with the config, and the round-trip is pinned in the selftest by re-parsing every exported URI and comparing the outbound it produces.
-
-Two things do not survive the trip, because they never reached the confdir either:
-
-- **The node's display name.** The outbound's tag takes its place, which is more useful anyway: `#prox-radikal_secure-12` says which pool and which node.
-- **hysteria2's `sni=` and `insecure=`.** `parse_hysteria2` keeps address, port and password and nothing else, so a URI carrying them would claim more than xray was told.
-
-Nodes reached by two subscriptions are exported once, on the same key `pool` dedupes with - the whole outbound bar its tag.
-They parse into two tags and two different-looking URIs and are the same configuration either way.
-One host that survived the prune under two different transports stays two entries: the observatory has just confirmed that both of them answer.
-An outbound with no URI form at all - a hand-added `freedom` in a `60-manual.json`, say - is **named on stderr** rather than dropped in silence, like every other skip in this tool.
-
-> The export is only as current as the last prune.
-> Report-only runs change nothing, so `./alive.sh` without `--prune` leaves the dead in the pool and therefore in the export.
-
-## Running it on a schedule
-
-`refresh.sh` is the whole loop in one command: fetch every subscription, restart, prune until the pool stops reporting failures, publish the survivors.
-
-```sh
-sudo ./install.sh                       # links /usr/local/bin/xray-refresh, seeds the list
-sudoedit /etc/xray/subscriptions.txt    # <pool-name> <url>, one per line
-sudo systemctl enable --now xray-refresh.timer
-journalctl -fu xray-refresh
-```
-
-Cron works too - the script locks itself, so an overlapping run is a no-op:
-
-```
-*/30 * * * * /usr/local/bin/xray-refresh >> /var/log/xray-refresh.log 2>&1
-```
-
-The timer is still the better option on a box that already runs xray under systemd: `OnUnitInactiveSec` measures the interval from when the last cycle **finished**, which matters because a cycle waits for the pool to go quiet and can legitimately take half an hour.
-
-### The cycle
-
-| step | what happens |
-|---|---|
-| 1 | fetch each subscription into its own pool, **as the uid the ruleset exempts from capture**. A fetch that fails, returns nothing, or parses to nothing leaves the pool already on disk alone |
-| 2 | `xray -test`, then `systemctl restart xray xray-nftables` |
-| 3 | every `REFRESH_EVERY` (30s), `alive.sh --prune`. If it deleted anything, restart and reset the clock. When nothing has failed for `REFRESH_QUIET` (5 min), it is settled |
-| 4 | `sub2xray.py export` to `$REFRESH_OUT`, written to a temp file in the same directory and renamed over the target |
-
-Knobs are environment variables, listed in `./refresh.sh --help`. `./refresh.sh selftest` runs the whole cycle against stubbed `systemctl`, `curl`, `journalctl` and `xray` - no service, no network.
-
-**The prune window is "since the last restart", never a fixed `-5m`.**
-A restart bursts every probe at once, so the failures that matter arrive immediately after it.
-A fixed window keeps re-reading the failures of nodes that were pruned two restarts ago and the loop never goes quiet.
-
-**Every prune is followed by a restart.**
-The running service keeps its old config, so without one it goes on dialling the nodes just deleted and goes on logging them as failures - which reads as a pool that never settles.
-
-**`xray -test` runs before every restart.**
-Bringing the capture up against a config xray will not load tproxies every packet at a port with nothing behind it, which takes the host off the network. `install.sh` guards the first start this way; this is the same gate on every later one.
-
-**Nothing is published unless the cycle settles.**
-If the loop hits `REFRESH_MAX` still churning, or `alive.sh` refuses the prune because `ALIVE_MIN` would be breached, `$REFRESH_OUT` is left exactly as it was and the script exits non-zero - visible as a failed unit, rather than quietly publishing a list already known to be dead.
-
-**The fetch must not depend on the pool it is replacing**, and nothing is stopped to arrange that.
-In full mode - or selective mode with the subscription's host in `domains.txt` - `curl` goes out through the balancer, and a pool in which everything has died is blackholed by `fallbackTag: block`.
-A captured fetch could therefore never repair a fully dead pool: the refresh would need a working proxy in order to fix a broken one, which is the one state it exists to get you out of.
-
-So the fetch runs as `$REFRESH_FETCH_USER` (default `xray`), and the output chain returns on `meta skuid xray` **before it marks anything** - the rule that stops xray capturing its own dials.
-Borrowing it means curl leaves the box directly however dead the pool is, with the proxy still up for everything else.
-
-That buys something stopping the services could not: **a direct fetch that fails is retried through the proxy.**
-A subscription host blocked on the direct path but reachable through the pool is fetched through the pool.
-
-> ⚠ It couples `refresh.sh` to `define XRAY_USER` in `nftables.conf`.
-> If those drift the fetch is captured again, silently, and the pool never recovers - so the exemption is checked against the **live** ruleset (`nft list chain ip xray output`, not the file on disk) and said out loud when it is missing. It is a warning rather than a refusal: the proxied retry may still get through.
-
-There is no prune *before* the refresh either: `pool` rewrites that pool's files wholesale a second later, so anything the prune deleted comes straight back. The settle loop is the quality gate, and it covers pools no longer listed too.
-
-**A confdir that fails `xray -test` leaves the running service completely alone.**
-It keeps serving the config it loaded at its last start, which is the safest end state available - and is the other reason nothing is stopped up front.
-
-> ⚠ `$REFRESH_OUT` is every surviving node's uuid or password in plain text.
-> It is written `0600`, and `subscriptions.txt` and `working.txt` are gitignored.
-
-## Telegram: publishing the list to a group
-
-`telegram/` is a container that watches `$REFRESH_OUT` and sends it to one chat whenever the contents change.
-
-```sh
-cd telegram
-cp config.ini.example config.ini    # api_id, api_hash, bot_token, chat_id
-docker compose up -d
-docker compose logs -f
-```
-
-`api_id`/`api_hash` come from [my.telegram.org](https://my.telegram.org); Telethon needs them even for a bot, because they identify the client rather than the account. The token comes from `@BotFather`, and the bot has to be a member of the group - it needs no admin rights unless the group restricts who may post.
-
-**It hashes the contents, not the mtime.**
-`refresh.sh` republishes on every settled cycle whether or not the survivors changed, and re-sending an identical list every half hour is how a group learns to mute you.
-The last-sent hash lives on a named volume beside the session, so a container restart neither re-authenticates nor re-sends what it already sent.
-
-**It polls rather than using inotify.**
-The publish is a rename over the path, which replaces the inode - an inotify watch follows the old one and silently never fires again.
-
-**It always sends a file, never a message.**
-A pool is past the 4096-character message limit at about 30 nodes, and a file is what the other end imports anyway.
-
-**The `chat_id` is turned into a peer arithmetically** (`-100…` is a supergroup, a bare negative is a basic group, positive is a user) rather than looked up. A bot's session starts empty and bots cannot enumerate their dialogs, so `get_entity()` on a group it was merely added to fails. The id is resolved once at startup, so a wrong one is an immediate exit with the reason rather than a watcher that looks healthy until the moment it has a job to do.
-
-`python3 telegram/bot.py selftest` checks the change detection and the peer arithmetic with no config and no network.
-
-> ⚠ This publishes credentials to everyone in that group, and nothing here can un-send them.
-> The container runs as root purely so it can read the `0600` list; it drops every capability, gets a read-only root filesystem, and mounts the list read-only.
-
-## wireguard peers
-
-```sh
-export WG_ENDPOINT=vpn.example.net:51820   # what the phone dials
-./wg-peer.sh add phone        # keypair, next free IP, QR, splice into config
-./wg-peer.sh list
-./wg-peer.sh regen [name]     # rebuild client .conf files, keys and IPs untouched
-./wg-peer.sh remove phone
-```
-
-`WG_ENDPOINT` defaults to the placeholder `vpn.example.com:51820`.
-Leave it unset and every QR you hand out points at a host that does not exist, with no error.
-
-`wg-peer` owns `05-wireguard.json` because only it can generate the server key.
-Xray rejects an empty `secretKey`, so there is no useful stub for Python to write.
-That file holds the inbound and nothing else.
-An inbound never dials an outbound directly in Xray; traffic crosses the dispatcher and the routing rules, so the wireguard inbound needs no outbound of its own, just the rules in `10-routing.json`.
-
-> In `selective` mode peers get the same selective treatment as everything else, so most of their traffic exits `direct` from this host.
-> Use `--mode full` if peers should exit through the pool.
-
-**`regen` is the recovery command, in both directions.**
-A peer's address is recorded twice and independently, in `allowedIPs` in the config and `Address` in the client `.conf`, so whichever survives rebuilds the other.
-
-| lost | recovered | from |
-|---|---|---|
-| `05-wireguard.json` | yes, `wg-peer regen` | each peer's `.conf`, plus `server.key` |
-| a client `.conf` | yes, `wg-peer regen [name]` | the config's `allowedIPs` |
-| both, `.key` survives | peer renumbered, with a warning | next free address |
-| **`$WG_STATE`** | nothing | keys are gone, every peer must be re-added |
-
-**`regen` never generates a key.**
-`wg genkey` runs in exactly two places: `add`, for a brand new peer, and the server key when `$WG_STATE/server.key` does not exist.
-
-> The one case that breaks every peer is a missing `$WG_STATE/server.key`.
-> The server key is then generated fresh, its public half changes, and no existing client config authenticates any more.
-
-## How the merge works
-
-`-confdir` reads the files in name order and merges them **by tag**.
-
-- Outbounds from different files accumulate. That is what makes pool files additive.
-- **A tag in two files is silently overwritten and the earlier node is destroyed.** Not mis-selected: gone from the merged config, with `Configuration OK` and no error. Tags are `prox-<pool>-<n>`, so pools collide only if two pools share a name.
-- Everything is selected by the `prox` prefix. Xray selectors are prefix matches and nothing else, so `TAG_PREFIX` here and `subjectSelector` in `10-routing.json` must agree.
-
-Chunk numbers are zero-padded because `-confdir` reads in name order, where `10` sorts before `2`.
-
-**Do not audit the merge by counting log lines.**
-Xray's logger is asynchronous and `-test` exits before it drains.
-A 200-node run printed 170 `prepend outbound` lines on one run and 173 on the next, while all 200 outbounds were present.
-To check what really merged:
-
-```sh
-xray convert pb conf/*.json | strings | grep -oE 'prox-[a-z]+-[0-9]+' | sort -u | wc -l
-```
-
-## Known limits
-
-- **One observatory, globally.** Observatories cannot be chained or nested, and every balancer shares this one. Probe scope is `subjectSelector` alone, never balancer membership.
-- **`burstObservatory`, never the plain `observatory`.** The plain one sleeps `probeInterval` *between each outbound*, so the interval is a per-node delay rather than a round period. Measured at 4 of 50 nodes reached in 40s at a 10s interval, which over 200 nodes at `3m` would be a ten hour round. Declare only one of the two; with both present, `leastLoad` silently degrades.
-- **Probe rate is `nodes / interval`, and the burst is the whole pool at once.** See [Sizing the pool](#sizing-the-pool).
-- **Startup fires every probe at once**, with no spread.
-- **`fallbackTag` is `block`.** When the strategy can pick nobody, chiefly the window after a restart, traffic is blackholed rather than falling through to whichever node happens to be first. It fails fast instead of timing out against one arbitrary node. It is also why `dns-direct` exists.
-- **`geosite:`/`geoip:` rules need the `.dat` files.** A missing one is a hard startup failure, not a warning. `xray.service` sets `XRAY_LOCATION_ASSET=/usr/share/xray`, which is right for Arch; Debian and the official install script use `/usr/local/share/xray`.
-- **The plain socks/http port is `auth: noauth` and listens on `0.0.0.0`.** That is an open proxy to anything that can route to this host, on every interface including a public one. It is a trust boundary you own: firewall the port, or narrow it with `--proxy-listen` (a LAN address, or `172.17.0.1` to serve only docker containers). The port is in `KEEP_DIRECT_PORTS` so the ruleset leaves it alone; a listener you add on another port needs the same exemption, or a connection to it arriving on a public interface is tproxy'd into the transparent door instead of reaching it.
-- **`--vless-listen` is off by default and generates its own uuid.** A literal uuid in a config template is a credential every clone shares, on an inbound that is reachable from the network by definition. It is minted **once** and read back on every later `init`, `--force` included, because rolling it leaves the inbound up and listening while every client holding the old one is quietly refused. `--vless-id` sets it explicitly.
-
-## Migrating
-
-If you were running the old `config.json` single-node setup, `sub2xray.py pool` accepts a file with one URI in it, and the balancer degenerates to that node.
-`update_outbound_from_sub.py` is gone: it picked the single lowest-ping VLESS node from a subscription and rewrote `config.json`, stopping both services for eight seconds to do it.
-`burstObservatory` plus the `lb` balancer does the same selection continuously, per connection, with no outage and no dependency on `python-v2ray`.
-
-If you were running the old `conf/` setup, `sub2xray.py init --force` rewrites the two scaffold files.
-Your pool files are untouched, but check the diff on `10-routing.json` first: the DNS design changed and the rule order matters.
+| `nftables.conf` | the capture loop, and the two rules that stop xray capturing itself |
+| `sub2xray.py` | which subscription entries become outbounds, split DNS, the observatory |
+| `alive.sh` | how deadness is measured, and why a clean bill of health is suspicious |
+| `refresh.sh` | why the fetch runs as the `xray` user, and why every prune is followed by a restart |
+| `telegram/bot.py` | why it polls rather than watching, and why a bot cannot look its own group up |
+
+This repo is the merge of two that were used together and kept drifting apart: the tproxy ruleset, units and installer from `xray-tproxy`, and the confdir generator, health check and wireguard tool from `xray-config`. Both histories are preserved.
+
+If you were running the old single-node `config.json`, `sub2xray.py pool` accepts a file with one URI in it. If you were running the old `conf/`, `init --force` rewrites the two scaffold files and leaves your pools alone - check the diff on `10-routing.json` first, the DNS design changed and rule order matters.

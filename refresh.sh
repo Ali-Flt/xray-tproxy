@@ -100,6 +100,10 @@ check_exempt() {
     say "WARNING: no user '$FETCH_USER' - the fetch cannot bypass the capture"
     return 1
   fi
+  # No table at all means nothing is being captured - on a first run, before
+  # xray-nftables has ever started. There is nothing to bypass, so this is not
+  # applicable rather than broken, and warning about it would be noise.
+  nft list table ip xray >/dev/null 2>&1 || return 0
   if ! nft list chain ip xray output 2>/dev/null \
        | grep -qE "skuid \"?($FETCH_USER|$uid)\"?"; then
     say "WARNING: 'meta skuid $FETCH_USER return' is not in the live ip xray output chain."
@@ -344,10 +348,19 @@ EOF
 out=$(run) || die "a missing exemption is a warning, not a refusal: $out"
 grep -q "skuid $WHO return' is not in the live" <<<"$out" \
   || die "the missing exemption was not reported: $out"
-ok "an exemption missing from the LIVE ruleset is said out loud, not assumed"
+# ...but no table at all is a first run, before the capture has ever started.
+# Nothing is being captured, so there is nothing to bypass and nothing to say.
+stub nft <<'EOF'
+[[ "${2:-}" == "table" ]] && exit 1
+echo "        ip daddr 10.0.0.0/8 return"
+EOF
+out=$(run) || die "a first run with no ruleset must not fail: $out"
+grep -q 'is not in the live' <<<"$out" && die "it warned when nothing is captured: $out"
+ok "no capture loaded at all is not reported as a missing exemption"
 stub nft <<'EOF'
 echo "        meta skuid \"$WHO\" return"
 EOF
+ok "an exemption missing from the LIVE ruleset is said out loud, not assumed"
 
 # Two cycles must not run at once: they restart the same services and rewrite
 # the same pool files.
