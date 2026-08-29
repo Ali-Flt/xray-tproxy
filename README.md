@@ -459,7 +459,7 @@ The timer is still the better option on a box that already runs xray under syste
 
 | step | what happens |
 |---|---|
-| 1 | each subscription is fetched and written to its own pool. A fetch that fails, returns nothing, or parses to nothing leaves the pool already on disk alone |
+| 1 | **stop xray**, then fetch each subscription into its own pool. A fetch that fails, returns nothing, or parses to nothing leaves the pool already on disk alone |
 | 2 | `xray -test`, then `systemctl restart xray xray-nftables` |
 | 3 | every `REFRESH_EVERY` (30s), `alive.sh --prune`. If it deleted anything, restart and reset the clock. When nothing has failed for `REFRESH_QUIET` (5 min), it is settled |
 | 4 | `sub2xray.py export` to `$REFRESH_OUT`, written to a temp file in the same directory and renamed over the target |
@@ -479,9 +479,17 @@ Bringing the capture up against a config xray will not load tproxies every packe
 **Nothing is published unless the cycle settles.**
 If the loop hits `REFRESH_MAX` still churning, or `alive.sh` refuses the prune because `ALIVE_MIN` would be breached, `$REFRESH_OUT` is left exactly as it was and the script exits non-zero - visible as a failed unit, rather than quietly publishing a list already known to be dead.
 
-**The services are not stopped for the refresh.**
-`pool` only writes files and xray does not watch the confdir, so the host keeps its proxy until the restart in step 2.
-Pruning *before* a refresh would also be dead work: `pool` rewrites that pool's files wholesale a second later, so anything the prune deleted comes straight back.
+**The services are stopped for the fetch, and the fetch alone.**
+Not because writing the confdir underneath a running xray is unsafe - it is not, xray does not watch it - but because **the fetch must not depend on the pool it is replacing**.
+In full mode, or in selective mode with the subscription's host in `domains.txt`, `curl` goes out through the balancer; and a pool in which everything has died is blackholed by `fallbackTag: block`.
+The refresh would then need a working proxy in order to fix a broken one, which is the one state it exists to get you out of.
+With the capture down the host is on plain, unproxied internet - the one path that cannot be broken by the pool being replaced.
+
+The stop is undone on the way out, including when the cycle dies partway: an `EXIT` trap restarts both services.
+**Unless the confdir does not pass `xray -test`, in which case both are deliberately left down.**
+Two services stopped is an unproxied host; the capture up with nothing behind it is a total outage.
+
+There is no prune *before* the refresh, though: `pool` rewrites that pool's files wholesale a second later, so anything the prune deleted comes straight back. The settle loop is the quality gate, and it covers pools no longer listed too.
 
 > ⚠ `$REFRESH_OUT` is every surviving node's uuid or password in plain text.
 > It is written `0600`, and `subscriptions.txt` and `working.txt` are gitignored.

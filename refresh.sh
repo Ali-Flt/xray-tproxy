@@ -13,8 +13,8 @@
 #
 # The cycle:
 #
-#   1. fetch every subscription in $REFRESH_SUBS, one pool per line
-#   2. xray -test, then restart xray and xray-nftables
+#   1. stop xray, then fetch every subscription in $REFRESH_SUBS
+#   2. xray -test, then start xray and xray-nftables
 #   3. prune whatever the observatory reports failing, restart, and repeat
 #      until nothing has failed for $REFRESH_QUIET
 #   4. export the survivors to $REFRESH_OUT, atomically
@@ -37,10 +37,17 @@
 # ⚠ $REFRESH_OUT is every surviving node's uuid or password in plain text, so it
 #   is written 0600. Anything you forward it to is publishing those credentials.
 #
-# ⚠ The services are NOT stopped for the refresh. `pool` only writes files and
-#   xray does not watch the confdir, so the host keeps its proxy until the
-#   restart in step 2 - and pruning before a refresh would be dead work anyway,
-#   because `pool` rewrites that pool's files wholesale a second later.
+# ⚠ The services are stopped for the FETCH, and the fetch alone. Not because
+#   writing the confdir underneath a running xray is unsafe - it is not, xray
+#   does not watch it - but because the fetch must not depend on the pool it is
+#   about to replace. In full mode, or in selective mode with the subscription's
+#   host in domains.txt, curl goes out through the balancer; and a pool in which
+#   everything has died is blackholed by fallbackTag: block. The refresh would
+#   then need a working proxy in order to fix a broken one.
+#
+# ⚠ There is no prune before the refresh. `pool` rewrites that pool's files
+#   wholesale a second later, so anything it deleted comes straight back. The
+#   settle loop is the quality gate, and it covers pools no longer listed too.
 set -euo pipefail
 
 # --help prints the header block above rather than a second copy of it, so the
@@ -76,6 +83,16 @@ pool_size() {
   jq -r '.outbounds[]?.tag' "$CONFDIR"/50-pool-*.json 2>/dev/null | grep -c . || true
 }
 
+stop_stack() {
+  # PartOf takes xray-nftables down with xray, but both are named so that a
+  # ruleset left loaded by a previous crash is cleared too. With the capture
+  # gone the host is on plain, unproxied internet - which is the point: it is
+  # the one path that cannot be broken by the pool being replaced.
+  say "stopping xray for the fetch"
+  systemctl stop xray.service xray-nftables.service
+  STOPPED=1
+}
+
 restart_stack() {
   # ⚠ Validate BEFORE restarting. The ruleset happily tproxies every packet at
   # a port with nothing behind it, so bringing the capture up against a config
@@ -87,7 +104,24 @@ restart_stack() {
     return 1
   fi
   systemctl restart xray.service xray-nftables.service
+  STOPPED=0
   RESTARTED_AT=$(date +%s)
+}
+
+restore_stack() {
+  # The EXIT path. Dying between the stop and the restart would otherwise leave
+  # the host with no proxy and nothing saying so.
+  (( STOPPED )) || return 0
+  if xray -test -confdir "$CONFDIR" >/dev/null 2>&1; then
+    say "restoring xray after an interrupted cycle"
+    systemctl start xray.service xray-nftables.service || true
+  else
+    # ⚠ Deliberately left down. Starting the capture against a config xray will
+    # not load tproxies every packet at a port with nothing behind it, which is
+    # a total outage; leaving both stopped is merely an unproxied host.
+    say "LEFT STOPPED: $CONFDIR does not pass xray -test. The host has plain"
+    say "  internet and no proxy. Fix the confdir, then: systemctl start xray xray-nftables"
+  fi
 }
 
 fetch_pools() {
@@ -194,12 +228,17 @@ selftest() {
 local SELF=$DIR/refresh.sh work; work=$(mktemp -d); trap 'rm -rf "$work"' RETURN
 mkdir -p "$work/bin" "$work/conf" "$work/out"
 export PATH="$work/bin:$PATH"
+# Every stub appends here, so the ORDER of what happened is assertable and not
+# just the fact of it. The stop has to come before the fetch, not merely exist.
+export CALLS="$work/calls"
+: > "$CALLS"
 ok() { echo "  ok - $1"; }
 die() { echo "FAIL - $1" >&2; exit 1; }
+at() { grep -n "$1" "$CALLS" | head -1 | cut -d: -f1; }
 
 stub() { { echo '#!/usr/bin/env bash'; cat; } > "$work/bin/$1"; chmod +x "$work/bin/$1"; }
-stub systemctl <<EOF
-echo "\$@" >> "$work/systemctl.calls"
+stub systemctl <<'EOF'
+echo "systemctl $*" >> "$CALLS"
 EOF
 stub xray <<'EOF'
 [[ "${1:-}" == "-test" ]] && exit 0
@@ -209,6 +248,7 @@ EOF
 # been pruned the tag is no longer in the pool, so alive.sh drops it as stale
 # and every later check is quiet - which is what lets the loop settle.
 stub curl <<'EOF'
+echo "curl" >> "$CALLS"
 out=""; while [[ $# -gt 0 ]]; do [[ "$1" == "-o" ]] && { out=$2; shift; }; shift; done
 cat > "$out" <<'URIS'
 vless://u1@a.example:443?security=tls&sni=a.example#one
@@ -233,6 +273,16 @@ grep -q 'pruned 1, 2 left' <<<"$out" || die "the failing node was not pruned: $o
 grep -q 'settled: 2' <<<"$out" || die "the loop never settled: $out"
 ok "one cycle pools, prunes what the journal reported, and settles"
 
+# ⚠ THE ORDER. In full mode the fetch goes out through the very pool it is
+# replacing, and a pool where everything died is blackholed by fallbackTag, so
+# a refresh that fetches first can never repair a fully dead pool.
+[[ -n "$(at 'systemctl stop')" ]] || die "the services were never stopped"
+(( $(at 'systemctl stop') < $(at '^curl') )) \
+  || die "the fetch ran before the stop, so it depended on the pool it replaces"
+(( $(at '^curl') < $(at 'systemctl restart') )) \
+  || die "the services came back before the fetch finished"
+ok "the stop precedes the fetch, and the fetch precedes the restart"
+
 [[ $(grep -c . "$work/out/working.txt") == 2 ]] || die "published the wrong count"
 grep -q 'a.example' "$work/out/working.txt" || die "the survivors were not published"
 grep -q 'b.example' "$work/out/working.txt" && die "a pruned node was published"
@@ -242,10 +292,8 @@ ok "the survivors are published 0600, and the pruned node is not among them"
 
 # ⚠ A prune that is not followed by a restart leaves the service dialling the
 # nodes it just deleted, so it goes on logging them and the pool never settles.
-grep -c 'restart xray.service' "$work/systemctl.calls" | grep -qv '^0$' \
-  || die "no restart was issued"
-[[ $(grep -c 'restart xray.service' "$work/systemctl.calls") -ge 2 ]] \
-  || die "the prune was not followed by its own restart: $(cat "$work/systemctl.calls")"
+[[ $(grep -c 'systemctl restart xray.service' "$CALLS") -ge 2 ]] \
+  || die "the prune was not followed by its own restart: $(cat "$CALLS")"
 ok "every prune is followed by a restart, or the journal keeps reporting it"
 
 # Two cycles must not run at once: they stop and start the same services and
@@ -254,30 +302,42 @@ ok "every prune is followed by a restart, or the journal keeps reporting it"
 # descriptor and goes on holding the lock after the flock process is killed.
 ( flock 9; sleep 3 ) 9>"$work/lock" &
 sleep 0.3
-before=$(wc -l < "$work/systemctl.calls")
+before=$(wc -l < "$CALLS")
 out=$(run) || die "an overlapping run must exit 0, not fail"
 grep -q 'already running' <<<"$out" || die "the lock did not hold: $out"
-[[ $(wc -l < "$work/systemctl.calls") == "$before" ]] || die "it restarted anyway"
+[[ $(wc -l < "$CALLS") == "$before" ]] || die "it touched the services anyway"
 wait
 ok "an overlapping run exits without touching the services"
 
-# A config xray will not load must never reach a restart: the ruleset would
-# tproxy every packet at a port with nothing behind it.
+# A config xray will not load must never reach a start: the ruleset would
+# tproxy every packet at a port with nothing behind it. Both stopped is an
+# unproxied host; the capture up with nothing behind it is a total outage.
+cp "$work/out/working.txt" "$work/out/expected"
 stub xray <<'EOF'
 echo "config error" >&2; exit 1
 EOF
-before=$(wc -l < "$work/systemctl.calls")
+: > "$CALLS"
 out=$(run) && die "a failing xray -test should have failed the cycle"
 grep -q 'xray -test FAILED' <<<"$out" || die "the -test failure was not reported: $out"
-[[ $(wc -l < "$work/systemctl.calls") == "$before" ]] || die "it restarted anyway"
-ok "a config that fails xray -test stops the cycle before any restart"
+grep -q 'LEFT STOPPED' <<<"$out" || die "it did not say the services were left down: $out"
+grep -q 'systemctl stop' "$CALLS" || die "it never stopped in the first place"
+grep -qE 'systemctl (start|restart)' "$CALLS" && die "it started the capture against a bad config"
+ok "a bad config leaves both services stopped rather than the capture up alone"
 
-# ...and a cycle that does not settle must leave the previous list alone.
-cp "$work/out/working.txt" "$work/out/expected"
+# ...but an interrupted cycle whose config is fine must put them back.
 stub xray <<'EOF'
 [[ "${1:-}" == "-test" ]] && exit 0
 exit 1
 EOF
+: > "$CALLS"
+printf 'test\n' > "$work/subs.txt"          # a line with no url: fetch_pools bails
+out=$(run) && die "a subscription list with no urls should fail the cycle"
+grep -q 'restoring xray' <<<"$out" || die "the trap did not restore the services: $out"
+(( $(at 'systemctl stop') < $(at 'systemctl start') )) || die "restore came before the stop"
+ok "a cycle that dies after the stop puts the services back on the way out"
+
+# ...and a cycle that does not settle must leave the previous list alone.
+printf 'test\thttps://example.invalid/sub.txt\n' > "$work/subs.txt"
 stub journalctl <<'EOF'
 echo 'vpn xray[1]: [Warning] app/observatory/burst: error ping https://x with prox-test-1: boom'
 echo 'vpn xray[1]: [Warning] app/observatory/burst: error ping https://x with prox-test-3: boom'
@@ -311,10 +371,13 @@ done
 exec 9>"$LOCK"
 flock -n 9 || { say "another refresh is already running - exiting"; exit 0; }
 
-WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+WORK=$(mktemp -d)
 RESTARTED_AT=0
+STOPPED=0
+trap 'restore_stack; rm -rf "$WORK"' EXIT
 
 say "refresh starting, confdir $CONFDIR"
+stop_stack
 fetch_pools
 settle
 publish
