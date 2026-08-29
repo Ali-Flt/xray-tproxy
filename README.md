@@ -124,6 +124,8 @@ That leaves port 22 alone. In `selective` mode it still goes direct, because ssh
 
 **`pool` and `export` drop repeated entries**, keyed on the whole outbound bar its tag - so one server offered over two transports stays two entries. Both say how many collapsed, which is why a settled pool of 13 can publish 5.
 
+**The bot posts the nodes as text, in fenced blocks.** Copyable, with no file to download - and split across several messages when the list passes Telegram's 4096-character limit, which a pool does at about seventeen nodes. The split is between URIs, never inside one.
+
 **The bot reaches Telegram through the pool, not around it.** Its container sits on a docker bridge, prerouting captures it like everything else, and `geoip:telegram` routes to the balancer - which is what you want, since Telegram direct is usually the blocked path. But it means the publisher cannot connect while the pool is down, and every refresh cycle restarts xray underneath it. It retries with a backoff rather than exiting; `cannot reach Telegram` in its log points at the pool, not at the bot.
 
 **`/var/lib/xray/working.txt` is a list of credentials.** Written `0600`. Anything you forward it to is publishing them, Telegram included, and nothing can un-send that. `conf/`, `subs/`, `subscriptions.txt`, `working.txt` and `telegram/config.ini` are gitignored.
@@ -138,6 +140,6 @@ The reasoning lives next to the code, not here:
 | `sub2xray.py` | which subscription entries become outbounds, split DNS, the observatory |
 | `alive.sh` | how deadness is measured, and why a clean bill of health is suspicious |
 | `refresh.sh` | why the fetch runs as the `xray` user, and why every prune is followed by a restart |
-| `telegram/bot.py` | why it polls rather than watching, and why a bot cannot look its own channel up |
+| `telegram/bot.py` | why it polls rather than watching, why the list is fenced, and why a bot cannot look its own channel up |
 
 Upgrading an existing confdir: `init --force` rewrites the two scaffold files and leaves your pools alone. Check the diff on `10-routing.json` first - rule order is load-bearing there.

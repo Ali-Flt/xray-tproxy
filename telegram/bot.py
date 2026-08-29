@@ -5,8 +5,8 @@
     python3 bot.py selftest        change detection only; no config, no network
 
 Written for refresh.sh's published node list, but it knows nothing about that
-file's format: it watches a path, and every time the bytes change it sends the
-file to one chat. Config in $TGPUSH_CONFIG, default /etc/tgpush/config.ini.
+file's format: it watches a path, and every time the bytes change it posts the
+lines to one chat, in fenced blocks split to fit Telegram's message limit. Config in $TGPUSH_CONFIG, default /etc/tgpush/config.ini.
 
 A channel and a supergroup are the same thing to MTProto - both are peers of
 type channel, both have ids of the form -100<id> - so chat_id takes either.
@@ -49,7 +49,6 @@ def load_config(path):
             "state": watch.get("state", "/var/lib/tgpush/state"),
             "session": watch.get("session", "/var/lib/tgpush/tgpush"),
             "caption": watch.get("caption", "{n} working nodes - {when}"),
-            "filename": watch.get("filename", "nodes-{stamp}.txt"),
         }
     except (KeyError, ValueError) as e:
         sys.exit(f"{path}: {e}")
@@ -120,19 +119,47 @@ def to_peer(chat_id):
     return {"user": PeerUser, "channel": PeerChannel, "chat": PeerChat}[kind](ident)
 
 
+# Telegram refuses a message over 4096 characters, and a pool of typical vless
+# URIs passes that at about seventeen nodes. So the list is split, never
+# truncated: a node list missing its tail is worse than a second message,
+# because nothing about it looks incomplete.
+BODY_BUDGET = 3900      # 4096, less the fence, the header and the counter
+
+
+def chunk(uris, budget=BODY_BUDGET):
+    """Group URIs into message-sized batches, never splitting one across two."""
+    out, cur, size = [], [], 0
+    for uri in uris:
+        if cur and size + len(uri) + 1 > budget:
+            out.append(cur)
+            cur, size = [], 0
+        cur.append(uri)
+        size += len(uri) + 1
+    if cur:
+        out.append(cur)
+    return out
+
+
 async def send(client, peer, cfg, body):
     now = datetime.now(timezone.utc)
-    stamp = now.strftime("%Y%m%dT%H%M%SZ")
-    fields = {"n": len(body.splitlines()), "when": now.strftime("%Y-%m-%d %H:%M UTC"),
-              "stamp": stamp}
-    # As a document, always. A pool is well past the 4096-character message
-    # limit at 30 nodes, and a file is what the other end imports anyway.
-    from telethon.tl.types import DocumentAttributeFilename
-    buf = body.encode()
-    await client.send_file(
-        peer, buf, caption=cfg["caption"].format(**fields),
-        force_document=True,
-        attributes=[DocumentAttributeFilename(cfg["filename"].format(**fields))])
+    uris = [line.strip() for line in body.splitlines() if line.strip()]
+    fields = {"n": len(uris), "when": now.strftime("%Y-%m-%d %H:%M UTC"),
+              "stamp": now.strftime("%Y%m%dT%H%M%SZ")}
+    parts = chunk(uris)
+    for i, part in enumerate(parts, 1):
+        head = cfg["caption"].format(**fields)
+        if len(parts) > 1:
+            head += f"  ({i}/{len(parts)})"
+        # A fenced block, not bare lines. A URI is full of _ * [ ] ( ) ~ ` and
+        # markdown would eat half of them and mangle the rest; inside a fence
+        # nothing is parsed, and Telegram renders it monospace with a copy
+        # button, which is the whole point of sending text rather than a file.
+        text = "**{}**\n```\n{}\n```".format(head, "\n".join(part))
+        # link_preview off, or a message of URLs grows a preview card for
+        # whichever one Telegram decides to resolve.
+        await client.send_message(peer, text, parse_mode="md", link_preview=False)
+        if i < len(parts):
+            await asyncio.sleep(1)   # polite, and well inside the flood limits
 
 
 async def pause(stop, seconds):
@@ -235,6 +262,18 @@ def _selftest():
         assert read_state(s) == first
         write_state(s, "second")                       # replaces, never appends
         assert read_state(s) == "second"
+
+    # ⚠ Split, never truncated, and never mid-URI: half a node is a node that
+    # looks usable and is not.
+    long_uri = "vless://" + "x" * 400
+    assert chunk([]) == []
+    assert chunk(["a", "b"]) == [["a", "b"]]
+    batches = chunk([long_uri] * 30)
+    assert sum(len(b) for b in batches) == 30, batches
+    assert all(sum(len(u) + 1 for u in b) <= BODY_BUDGET for b in batches), batches
+    assert all(u == long_uri for b in batches for u in b), "a URI was cut in half"
+    # one URI larger than the budget still goes out whole rather than sliced
+    assert chunk(["y" * 5000]) == [["y" * 5000]]
 
     # The peer is constructed rather than looked up: a bot's session is empty
     # and cannot resolve a group it was merely added to.

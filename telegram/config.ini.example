@@ -34,6 +34,8 @@ interval = 30
 state = /var/lib/tgpush/state
 session = /var/lib/tgpush/tgpush
 
-# {n} nodes, {when} human time, {stamp} a filename-safe UTC timestamp.
+# Bold header above each message. {n} nodes, {when} human time, {stamp} a
+# compact UTC timestamp. The nodes follow in a fenced block, split across
+# several messages when the list passes Telegram's 4096-character limit -
+# about seventeen nodes - with a (1/3) counter appended to this line.
 caption = {n} working nodes - {when}
-filename = nodes-{stamp}.txt
