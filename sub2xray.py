@@ -202,17 +202,28 @@ def parse_vless(uri, tag):
 
 
 def parse_trojan(uri, tag):
-    u = urlparse(uri)
-    q = {k: v[0] for k, v in parse_qs(u.query).items()}
-    sni = q.get("sni", u.hostname)
+    # Manual parse: trojan passwords can contain +, /, @ which confuse
+    # urlparse.  Strip scheme, then split fragment -> query -> userinfo@hostport.
+    body = uri[9:]  # strip 'trojan://'
+    body, _, frag = body.partition("#")
+    body, _, query = body.partition("?")
+    q = {k: v[0] for k, v in parse_qs(query).items()}
+    at_idx = body.rfind("@")
+    if at_idx == -1:
+        # No password in this URI - xray will refuse it anyway
+        raise ValueError("trojan without a password (no @ in URI)")
+    password = unquote(body[:at_idx])
+    hostport = body[at_idx + 1:].rstrip("/")
+    host, _, port = hostport.rpartition(":")
+    sni = q.get("sni", host)
     if q.get("type", "tcp") == "http":
         q["type"] = "xhttp"
     out = {
         "tag": tag,
         "protocol": "trojan",
         "settings": {"servers": [{
-            "address": u.hostname, "port": u.port or 443,
-            "password": unquote(u.username or ""),
+            "address": host, "port": int(port) if port else 443,
+            "password": password,
         }]},
         "streamSettings": stream(
             q.get("type", "tcp"), q.get("security", "tls"), sni,
@@ -807,6 +818,17 @@ def _selftest():
     assert t["settings"]["servers"][0]["password"] == "p@ss"
     assert t["settings"]["servers"][0]["address"] == "ex.com"
     assert t["streamSettings"]["wsSettings"]["path"] == "/p"
+    # Trojan with + and / in password (confuses urlparse's / handling)
+    t2 = parse("trojan://ZcV1AKzS1KPuLXOvW3RXr+HFldso5hZoaMpZ/qbeEW4=@130.185.122.106:2053?security=tls&fp=chrome#DE",
+               "prox-t2")
+    assert t2["protocol"] == "trojan"
+    assert t2["settings"]["servers"][0]["password"] == "ZcV1AKzS1KPuLXOvW3RXr+HFldso5hZoaMpZ/qbeEW4="
+    assert t2["settings"]["servers"][0]["address"] == "130.185.122.106"
+    assert t2["settings"]["servers"][0]["port"] == 2053
+    # @ in password (userinfo before last @)
+    t3 = parse("trojan://!str18844@zxcvbn@os-tr-2.cats22.net:443#JP", "prox-t3")
+    assert t3["settings"]["servers"][0]["password"] == "!str18844@zxcvbn"
+    assert t3["settings"]["servers"][0]["address"] == "os-tr-2.cats22.net"
 
     # ss:// in all three shapes. SIP002 base64 userinfo, SIP002 plain (what the
     # 2022 ciphers use), and the legacy all-in-one-blob form.
