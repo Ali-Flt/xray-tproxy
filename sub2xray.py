@@ -529,7 +529,7 @@ def build(raw, pool):
     """
     # Input is either base64 of the URI list, or the URIs already.
     text = raw if "://" in raw else b64d(raw)
-    outbounds, skipped = [], {}
+    outbounds, skipped, seen, dupes = [], {}, set(), 0
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -541,6 +541,14 @@ def build(raw, pool):
             skipped.setdefault(scheme, []).append(f"{_where(line)} - {e}")
             continue
         if ob:
+            # Before --limit, which is applied by the caller: a subscription
+            # that repeats itself would otherwise spend the budget on clones,
+            # and the observatory would probe one server as though it were six.
+            ident = config_id(ob)
+            if ident in seen:
+                dupes += 1
+                continue
+            seen.add(ident)
             ob["tag"] = f"{TAG_PREFIX}-{pool}-{len(outbounds) + 1}"
             outbounds.append(ob)
         else:
@@ -553,6 +561,13 @@ def build(raw, pool):
         print(f"skipped {len(why)} {scheme} node(s):", file=sys.stderr)
         for w in why:
             print(f"  {w}", file=sys.stderr)
+    if dupes:
+        # Counted, not named, and that is not the inconsistency it looks like:
+        # a skip is a node you asked for and cannot have, which is worth a name
+        # and a reason. A duplicate is the same node twice - nothing is lost,
+        # so the count is the whole of the information.
+        print(f"deduped {dupes} repeated node(s); {len(outbounds)} distinct",
+              file=sys.stderr)
     if not outbounds:
         sys.exit("no vless/vmess/trojan/ss nodes found in input")
     return {"outbounds": outbounds}
@@ -575,6 +590,20 @@ def node_id(ob):
         v = st
         secret = st.get("password", "")
     return f"{v['address']}:{v['port']}:{secret}"
+
+
+def config_id(ob):
+    """The whole outbound bar its tag: what dedupe keys on.
+
+    NOT node_id, deliberately. Two entries can name the same server and the
+    same credential and still be different configurations - one host offered
+    over ws and over grpc, or under two SNIs - and only one of the two may
+    actually work. Measured against a 1033-entry subscription: 56 entries were
+    exact repeats of another, and a further 51 were the same server under a
+    different configuration. Keying on node_id would have discarded those 51
+    before the observatory ever got to find out which of them answered.
+    """
+    return json.dumps({k: v for k, v in ob.items() if k != "tag"}, sort_keys=True)
 
 
 def inbounds_conf(tproxy_port, proxy_listen, proxy_port, vless, vless_id,
@@ -909,9 +938,12 @@ def export_uris(outdir, name=None):
     is the set of nodes that survived it - alive.sh deletes the dead ones from
     exactly these files. No aliveness is judged here; the confdir is.
 
-    Deduped by node_id rather than by URI: the same node reached from two
-    subscriptions parses into two tags and two different-looking URIs, and
-    whoever imports this list would then probe it twice.
+    Deduped by config_id, which is what `pool` deduped on: the same node
+    reached from two subscriptions parses into two tags and two
+    different-looking URIs, and whoever imports this list would then probe it
+    twice. Keyed on the configuration rather than the server, so one host
+    offered over two transports stays two entries - the observatory has just
+    confirmed that both of them answer.
     """
     pattern = f"50-pool-{name}-*.json" if name else "50-pool-*.json"
     uris, seen, unconvertible, duplicates = [], {}, [], []
@@ -933,7 +965,7 @@ def export_uris(outdir, name=None):
                     f"{ob.get('tag', '?')} - no URI form for protocol "
                     f"{ob.get('protocol', '?')!r}")
                 continue
-            ident = node_id(ob)
+            ident = config_id(ob)
             if ident in seen:
                 duplicates.append(f"{ob.get('tag', '?')} is {seen[ident]}")
                 continue
@@ -948,8 +980,8 @@ def export_uris(outdir, name=None):
     for why in unconvertible:
         print(f"not exported: {why}", file=sys.stderr)
     if duplicates:
-        print(f"deduped {len(duplicates)} node(s) - same address, port and "
-              f"credential as one already exported:", file=sys.stderr)
+        print(f"deduped {len(duplicates)} node(s) - identical configuration "
+              f"to one already exported:", file=sys.stderr)
         for why in duplicates:
             print(f"  {why}", file=sys.stderr)
     return uris
@@ -1106,6 +1138,37 @@ def _selftest():
             parse(bad, "t"); assert False, f"{bad} should have been refused"
         except ValueError:
             pass
+
+    # ---- dedupe keys on the CONFIGURATION, not the server ---------------
+    # Same host, same credential, different transport. node_id cannot tell
+    # these apart and config_id must, because only one of them may work and
+    # nothing has probed either of them yet.
+    same_server = parse("vless://u@a.com:443?security=tls", "t")
+    other_transport = parse("vless://u@a.com:443?type=ws&security=tls", "t")
+    assert node_id(same_server) == node_id(other_transport)
+    assert config_id(same_server) != config_id(other_transport)
+    # the tag is excluded, or nothing would ever dedupe: tags are positional
+    a1, a2 = parse("vless://u@a.com:443", "prox-x-1"), parse("vless://u@a.com:443", "prox-x-9")
+    assert config_id(a1) == config_id(a2)
+
+    buf, old = io.StringIO(), sys.stderr
+    sys.stderr = buf
+    try:
+        deduped = build("\n".join([
+            "vless://u@a.com:443?security=tls#one",
+            "vless://u@a.com:443?security=tls#two",          # identical, dropped
+            "vless://u@a.com:443?type=ws&security=tls#three",  # NOT a duplicate
+        ]), "d")["outbounds"]
+    finally:
+        sys.stderr = old
+    assert [o["tag"] for o in deduped] == ["prox-d-1", "prox-d-2"], deduped
+    assert deduped[1]["streamSettings"]["network"] == "ws", "a distinct config was dropped"
+    assert "deduped 1 repeated node(s); 2 distinct" in buf.getvalue(), buf.getvalue()
+    # tags stay contiguous: a gap would not break xray, but the pool file would
+    # stop matching what the count says it holds
+    assert [o["tag"] for o in build("vless://u@a.com:443\nvless://u@a.com:443\n"
+                                    "vless://u@b.com:443", "d")["outbounds"]] \
+        == ["prox-d-1", "prox-d-2"]
 
     # ---- to_uri is the inverse of parse ---------------------------------
     # The pool files are the only record of a node, so a field lost on the way

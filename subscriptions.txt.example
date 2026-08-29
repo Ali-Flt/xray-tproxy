@@ -8,6 +8,9 @@
 #
 # Blank lines and # comments are ignored. Names may not contain whitespace.
 #
+# Repeated entries are dropped before the cap applies, so REFRESH_LIMIT buys
+# distinct configurations rather than clones of one server.
+#
 # REFRESH_LIMIT (default 150) caps each one. That cap is per subscription and
 # the observatory probes the TOTAL, concurrently, every interval - so four
 # subscriptions at 150 is 600 nodes probed every 3 minutes, which is the point

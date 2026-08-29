@@ -247,6 +247,18 @@ Below the port-53 rule, a resolver's own query matches that rule and is handed b
 | `hysteria://` `hy://` | **skipped**, that outbound only speaks version 2 and v1 is dead upstream |
 | `ss://` with a legacy cipher or `?plugin=` | **skipped**, xray dropped the stream ciphers and plugins are separate processes it cannot host |
 
+**Repeats are dropped, and distinct configurations are not.**
+`pool` deduplicates before `--limit` applies, so the budget buys distinct nodes rather than clones and the observatory does not probe one server six times.
+The key is the whole outbound bar its tag, **not** the server: the same host and credential offered over two transports, or under two SNIs, is two configurations of which only one may work, and nothing has probed either yet.
+Measured against a 1033-entry subscription: 56 exact repeats, and a further 51 that were the same server configured differently. Keying on the server would have thrown those 51 away unprobed.
+
+```
+deduped 56 repeated node(s); 977 distinct
+--limit: keeping 150 of 977 nodes in pool 'radikal_secure'; the rest are not written
+```
+
+A duplicate is counted rather than named, which is not the inconsistency it looks like next to the rule below: a skip is a node you asked for and cannot have, so it needs a name and a reason. A duplicate is the same node twice, and nothing is lost.
+
 **Every skip is counted and named on stderr**, per scheme, with the node's `host:port` and the reason.
 
 ```
@@ -429,8 +441,9 @@ Two things do not survive the trip, because they never reached the confdir eithe
 - **The node's display name.** The outbound's tag takes its place, which is more useful anyway: `#prox-radikal_secure-12` says which pool and which node.
 - **hysteria2's `sni=` and `insecure=`.** `parse_hysteria2` keeps address, port and password and nothing else, so a URI carrying them would claim more than xray was told.
 
-Nodes reached by two subscriptions are exported once.
-They parse into two tags and two different-looking URIs, and are the same server either way, so `export` dedupes on the same identity `alive.sh` uses: address, port and credential.
+Nodes reached by two subscriptions are exported once, on the same key `pool` dedupes with - the whole outbound bar its tag.
+They parse into two tags and two different-looking URIs and are the same configuration either way.
+One host that survived the prune under two different transports stays two entries: the observatory has just confirmed that both of them answer.
 An outbound with no URI form at all - a hand-added `freedom` in a `60-manual.json`, say - is **named on stderr** rather than dropped in silence, like every other skip in this tool.
 
 > The export is only as current as the last prune.
