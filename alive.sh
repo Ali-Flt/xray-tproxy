@@ -210,6 +210,32 @@ reset_pool; chmod 640 "$work/conf/50-pool-de-1.json"; journal "$W"
   || die "prune did not preserve 640, got $(stat -c %a "$work/conf/50-pool-de-1.json")"
 ok "a prune leaves the pool file's permissions exactly as it found them"
 
+# REGRESSION: a prune whose jq could not read a pool file left its mktemp
+# behind. set -e ignores a failure anywhere but the last command of an && list,
+# so the loop carried on as though it had pruned, and the leftovers are
+# invisible - no .json suffix, so -confdir skips them and nothing complains.
+# One confdir accumulated 170.
+reset_pool; journal "$W"
+echo 'not json at all' > "$work/conf/50-pool-bad-1.json"
+out=$("$ALIVE" --prune 2>&1)
+[[ -z "$(find "$work/conf" -name '.prune.*' -print -quit)" ]] \
+  || die "a failed rewrite leaked its temp file: $(ls -a "$work/conf")"
+grep -q 'is not valid json' <<<"$out" || die "the unreadable file was not named: $out"
+[[ $(tags) == '["prox-de-1","prox-de-3"]' ]] || die "one bad file stopped the whole prune"
+rm -f "$work/conf/50-pool-bad-1.json"
+ok "a pool file that cannot be rewritten is named, and leaks no temp file"
+
+# ...and whatever an earlier run leaked is swept, since no trap can cover a
+# kill -9 between the mktemp and the mv.
+reset_pool; journal "$W"
+touch -d '2 hours ago' "$work/conf/.prune.oldone"
+touch "$work/conf/.prune.freshone"
+"$ALIVE" --prune >/dev/null
+[[ ! -e "$work/conf/.prune.oldone" ]] || die "a stale temp file was not swept"
+[[ -e "$work/conf/.prune.freshone" ]] || die "it swept a file a concurrent run may own"
+rm -f "$work/conf/.prune.freshone"
+ok "stale temp files are swept, and a concurrent run's is left alone"
+
 # --help is generated from the header comment, so it breaks silently if the
 # sed range stops matching. Pin both ends of that range.
 out=$("$ALIVE" --help)
@@ -226,9 +252,25 @@ command -v jq >/dev/null || { echo "jq not on PATH" >&2; exit 1; }
 compgen -G "$CONFDIR/50-pool-*.json" >/dev/null || {
   echo "no pool files in $CONFDIR - run: sub2xray.py pool --name <name> <sub>" >&2; exit 1; }
 
+# ⚠ The parseable pool files, worked out ONCE and used everywhere below.
+# jq takes its file arguments in order and STOPS at the first it cannot parse,
+# so one corrupt file hid every pool file after it - and the ones before it
+# too, because the non-zero exit killed the run at the first assignment under
+# `set -e`: no output, no reason, exit 1. A file truncated by a crash mid-write
+# is enough, and the confdir is exactly where that happens.
+POOLS=()
+for f in "$CONFDIR"/50-pool-*.json; do
+  if jq -e . "$f" >/dev/null 2>&1; then
+    POOLS+=("$f")
+  else
+    echo "warning: $f is not valid json - ignoring it" >&2
+  fi
+done
+(( ${#POOLS[@]} )) || { echo "no readable pool files in $CONFDIR" >&2; exit 1; }
+
 # Counted before anything is deleted, or the denominator would describe the pool
 # we just shrank rather than the one we read about.
-total=$(jq -r '.outbounds[]?.tag' "$CONFDIR"/50-pool-*.json 2>/dev/null | sort -u | grep -c . || true)
+total=$(jq -r '.outbounds[]?.tag' "${POOLS[@]}" 2>/dev/null | sort -u | grep -c . || true)
 
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 journalctl "$SCOPE" -u "$UNIT" --since "$SINCE" --no-pager > "$work/probe.log" 2>&1 || true
@@ -243,8 +285,8 @@ failed=$(grep -oE 'error ping .* with prox-[a-zA-Z0-9_-]+:' "$work/probe.log" \
 checked=$(grep -oE 'burst: checking prox-[a-zA-Z0-9_-]+' "$work/probe.log" \
           | awk '{print $3}' | sort -u || true)
 
-pool_tags() { jq -r '.outbounds[]?.tag' "$CONFDIR"/50-pool-*.json 2>/dev/null \
-              | grep '^prox-' | sort -u; }
+pool_tags() { jq -r '.outbounds[]?.tag' "${POOLS[@]}" 2>/dev/null \
+              | grep '^prox-' | sort -u || true; }
 
 # The journal outlives the config: nodes pruned an hour ago still appear in it,
 # and hand-added outbounds (60-manual.json) were never in the pool glob at all.
@@ -284,7 +326,7 @@ n_failed=$(grep -c . <<<"$failed" || true)
 # killed the script mid-report: no DEAD section, no prune, no summary, exit 1,
 # and the `2>/dev/null` that used to be here hid the reason. awk needs no order.
 addr() { jq -r '.outbounds[]? | "\(.tag)\t\(.settings.vnext[0].address // .settings.servers[0].address // "?")"' \
-         "$CONFDIR"/50-pool-*.json 2>/dev/null; }
+         "${POOLS[@]}" 2>/dev/null; }
 show() { [[ -n "$1" ]] || return 0
   echo "$2"
   awk -F'\t' 'NR==FNR{a[$1]=$2; next} NF{printf "  %s\t%s\n", $1, ($1 in a ? a[$1] : "?")}' \
@@ -319,19 +361,35 @@ if [[ $PRUNE -eq 1 ]]; then
     # .prune.XXXXXX has no .json suffix, so -confdir never reads it mid-write,
     # and it is inside CONFDIR so the mv is atomic on the same filesystem.
     tags=$(jq -Rn '[inputs | select(length > 0)]' <<<"$failed")
-    for f in "$CONFDIR"/50-pool-*.json; do
+    # Anything an earlier run left behind. A trap cannot cover a kill -9 or a
+    # power loss between the mktemp and the mv, and these are invisible: no
+    # .json suffix, so -confdir ignores them and nothing ever complains. One
+    # confdir had 170. An hour old, so a concurrent run's file is left alone.
+    find "$CONFDIR" -maxdepth 1 -name '.prune.*' -mmin +60 -delete 2>/dev/null || true
+    for f in "${POOLS[@]}"; do
       tmp=$(mktemp "$CONFDIR/.prune.XXXXXX")
       # mktemp creates the file 0600, and mv carries the SOURCE's mode and
       # owner onto the destination rather than keeping the destination's. So a
       # prune rewrote every pool file it touched to rw------- root:root, and
       # xray - which runs as its own user - could no longer read its own
       # config. Put the original's metadata on the replacement before renaming.
-      jq --argjson t "$tags" \
-        '.outbounds |= map(select(.tag as $x | $t | index($x) | not))' \
-        "$f" > "$tmp" \
-        && chmod --reference="$f" "$tmp" \
-        && { chown --reference="$f" "$tmp" 2>/dev/null || true; } \
-        && mv "$tmp" "$f"
+      # ⚠ An `if`, not an && chain. set -e ignores a failure anywhere but the
+      # LAST command of such a chain, so a jq that could not read the pool file
+      # left the temp behind and the loop carried on as though it had pruned -
+      # silently, because the leftover has no .json suffix for anything to
+      # notice. Now the temp is removed on every path that is not the mv, and
+      # the file that could not be rewritten is named.
+      if jq --argjson t "$tags" \
+           '.outbounds |= map(select(.tag as $x | $t | index($x) | not))' \
+           "$f" > "$tmp" \
+         && chmod --reference="$f" "$tmp" \
+         && { chown --reference="$f" "$tmp" 2>/dev/null || true; }
+      then
+        mv "$tmp" "$f"
+      else
+        rm -f "$tmp"
+        echo "  could not rewrite $f - left as it was" >&2
+      fi
       # If pruning emptied the pool, remove the file entirely rather than
       # leaving a skeleton {"outbounds":[]}.  Keeps the config dir tidy and
       # prevents a silent zero-size outbound list from being loaded by xray.
