@@ -184,6 +184,8 @@ def parse_vless(uri, tag):
     net = q.get("type", "tcp")
     if net == "http":
         net = "xhttp"
+    if net not in ("tcp", "ws", "grpc", "xhttp", "kcp", "quic", "h2", "raw", "httpupgrade", "splithttp"):
+        raise ValueError(f"vless unknown transport: {net!r}")
     out = {
         "tag": tag,
         "protocol": "vless",
@@ -216,8 +218,11 @@ def parse_trojan(uri, tag):
     hostport = body[at_idx + 1:].rstrip("/")
     host, _, port = hostport.rpartition(":")
     sni = q.get("sni", host)
-    if q.get("type", "tcp") == "http":
-        q["type"] = "xhttp"
+    net = q.get("type", "tcp")
+    if net == "http":
+        net = "xhttp"
+    if net not in ("tcp", "ws", "grpc", "xhttp", "kcp", "quic", "h2", "raw", "httpupgrade", "splithttp"):
+        raise ValueError(f"trojan unknown transport: {net!r}")
     out = {
         "tag": tag,
         "protocol": "trojan",
@@ -226,7 +231,7 @@ def parse_trojan(uri, tag):
             "password": password,
         }]},
         "streamSettings": stream(
-            q.get("type", "tcp"), q.get("security", "tls"), sni,
+            net, q.get("security", "tls"), sni,
             q.get("host", ""), unquote(q.get("path", "/")),
             q.get("serviceName", ""), q.get("fp", ""),
             q.get("pbk", ""), q.get("sid", "")),
@@ -240,6 +245,8 @@ def parse_vmess(uri, tag):
     net = c.get("net", "tcp")
     if net == "http":
         net = "xhttp"
+    if net not in ("tcp", "ws", "grpc", "xhttp", "kcp", "quic", "h2", "http", "splithttp", "raw", "httpupgrade", "mKCP", "reality"):
+        raise ValueError(f"vmess unknown transport: {net!r}")
     security = "tls" if str(c.get("tls", "")) in ("tls", "true", "1") else "none"
     out = {
         "tag": tag,
