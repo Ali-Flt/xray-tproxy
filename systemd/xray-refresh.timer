@@ -11,7 +11,23 @@ OnUnitInactiveSec=30min
 # Free public pools are shared; do not have every installation of this hit the
 # same subscription URLs on the same minute.
 RandomizedDelaySec=3min
-Persistent=true
+
+# Change the interval with a drop-in rather than by editing this file, so it
+# survives install.sh --force-units:
+#
+#   systemctl edit xray-refresh.timer
+#     [Timer]
+#     OnUnitInactiveSec=
+#     OnUnitInactiveSec=15min
+#
+# ⚠ The empty assignment is not decoration. Monotonic timer settings ACCUMULATE
+#   across drop-ins: without it you get two triggers, the old one and the new,
+#   and the timer fires on whichever comes first.
+#
+# Persistent= is deliberately absent. It only affects OnCalendar= timers - it
+# catches up a wall-clock run missed while the machine was off - and does
+# nothing at all beside a monotonic one, so it was a no-op claiming to be a
+# setting. Switch to OnCalendar= and it becomes worth adding.
 
 [Install]
 WantedBy=timers.target
