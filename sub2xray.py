@@ -186,6 +186,10 @@ def parse_vless(uri, tag):
         net = "xhttp"
     if net not in ("tcp", "ws", "grpc", "xhttp", "kcp", "quic", "h2", "raw", "httpupgrade", "splithttp"):
         raise ValueError(f"vless unknown transport: {net!r}")
+    # Legacy XTLS removed in Xray 5.x: security=xtls -> security=tls
+    security = q.get("security", "none")
+    if security == "xtls":
+        security = "tls"
     out = {
         "tag": tag,
         "protocol": "vless",
@@ -195,7 +199,7 @@ def parse_vless(uri, tag):
                        "flow": q.get("flow", "")}],
         }]},
         "streamSettings": stream(
-            net, q.get("security", "none"), sni,
+            net, security, sni,
             q.get("host", ""), unquote(q.get("path", "/")),
             q.get("serviceName", ""), q.get("fp", ""),
             q.get("pbk", ""), q.get("sid", "")),
@@ -223,6 +227,11 @@ def parse_trojan(uri, tag):
         net = "xhttp"
     if net not in ("tcp", "ws", "grpc", "xhttp", "kcp", "quic", "h2", "raw", "httpupgrade", "splithttp"):
         raise ValueError(f"trojan unknown transport: {net!r}")
+    # Legacy XTLS removed in Xray 5.x: security=xtls -> security=tls
+    # (XTLS is now xtls-rprx-vision flow with TLS, not a separate security mode)
+    security = q.get("security", "tls")
+    if security == "xtls":
+        security = "tls"
     out = {
         "tag": tag,
         "protocol": "trojan",
@@ -231,7 +240,7 @@ def parse_trojan(uri, tag):
             "password": password,
         }]},
         "streamSettings": stream(
-            net, q.get("security", "tls"), sni,
+            net, security, sni,
             q.get("host", ""), unquote(q.get("path", "/")),
             q.get("serviceName", ""), q.get("fp", ""),
             q.get("pbk", ""), q.get("sid", "")),
@@ -836,6 +845,12 @@ def _selftest():
     t3 = parse("trojan://!str18844@zxcvbn@os-tr-2.cats22.net:443#JP", "prox-t3")
     assert t3["settings"]["servers"][0]["password"] == "!str18844@zxcvbn"
     assert t3["settings"]["servers"][0]["address"] == "os-tr-2.cats22.net"
+    # Legacy XTLS removed in Xray 5.x: security=xtls -> security=tls
+    t4 = parse("trojan://pw@host.com:443?flow=xtls-rprx-direct&security=xtls#test", "prox-t4")
+    assert t4["streamSettings"]["security"] == "tls"
+    # vless with legacy XTLS
+    v2 = parse("vless://uid@host.com:443?security=xtls#v", "prox-v2")
+    assert v2["streamSettings"]["security"] == "tls"
 
     # ss:// in all three shapes. SIP002 base64 userinfo, SIP002 plain (what the
     # 2022 ciphers use), and the legacy all-in-one-blob form.
