@@ -190,6 +190,9 @@ def parse_vless(uri, tag):
     security = q.get("security", "none")
     if security == "xtls":
         security = "tls"
+    # REALITY requires a public key; without it the node is broken
+    if security == "reality" and not q.get("pbk"):
+        raise ValueError("reality without public key (pbk)")
     out = {
         "tag": tag,
         "protocol": "vless",
@@ -232,6 +235,9 @@ def parse_trojan(uri, tag):
     security = q.get("security", "tls")
     if security == "xtls":
         security = "tls"
+    # REALITY requires a public key; without it the node is broken
+    if security == "reality" and not q.get("pbk"):
+        raise ValueError("reality without public key (pbk)")
     out = {
         "tag": tag,
         "protocol": "trojan",
@@ -851,6 +857,21 @@ def _selftest():
     # vless with legacy XTLS
     v2 = parse("vless://uid@host.com:443?security=xtls#v", "prox-v2")
     assert v2["streamSettings"]["security"] == "tls"
+    # reality without pbk is refused (Xray will fail with empty password)
+    try:
+        parse("trojan://pw@host.com:443?security=reality&sni=s.com#broken", "prox-rb")
+        assert False, "should have been refused"
+    except ValueError as e:
+        assert "reality without public key" in str(e)
+    try:
+        parse("vless://uid@host.com:443?security=reality&sni=s.com#broken", "prox-vb")
+        assert False, "should have been refused"
+    except ValueError as e:
+        assert "reality without public key" in str(e)
+    # reality WITH pbk is fine
+    vr = parse("vless://uid@host.com:443?security=reality&pbk=abc123&sni=s.com#ok", "prox-vr")
+    assert vr["streamSettings"]["security"] == "reality"
+    assert vr["streamSettings"]["realitySettings"]["publicKey"] == "abc123"
 
     # ss:// in all three shapes. SIP002 base64 userinfo, SIP002 plain (what the
     # 2022 ciphers use), and the legacy all-in-one-blob form.
