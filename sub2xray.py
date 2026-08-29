@@ -255,7 +255,10 @@ def parse_trojan(uri, tag):
 
 
 def parse_vmess(uri, tag):
-    c = json.loads(b64d(uri[len("vmess://"):]))
+    # The name lives inside the base64 as "ps", but some subscriptions append a
+    # #fragment anyway. It is not part of the payload, and left on it the
+    # decode fails with "Incorrect padding" and the node is lost.
+    c = json.loads(b64d(uri[len("vmess://"):].split("#", 1)[0]))
     sni = c.get("sni") or c.get("host") or c.get("add")
     net = c.get("net", "tcp")
     if net == "http":
@@ -835,6 +838,8 @@ def _selftest():
     m = parse("vmess://" + raw, "prox-2")
     assert m["settings"]["vnext"][0]["address"] == "ex.com"
     assert m["streamSettings"]["security"] == "tls"
+    # a #fragment is not part of the base64 payload; it used to break the decode
+    assert parse("vmess://" + raw + "#Frankfurt", "prox-2") == m
     t = parse("trojan://p%40ss@ex.com:443?type=ws&security=tls&sni=h.com&path=%2Fp#n", "prox-3")
     assert t["protocol"] == "trojan"
     assert t["settings"]["servers"][0]["password"] == "p@ss"
