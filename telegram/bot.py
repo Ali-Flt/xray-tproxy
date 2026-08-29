@@ -5,8 +5,8 @@
     python3 bot.py selftest        change detection only; no config, no network
 
 Written for refresh.sh's published node list, but it knows nothing about that
-file's format: it watches a path, and every time the bytes change it posts the
-lines to one chat, in fenced blocks split to fit Telegram's message limit. Config in $TGPUSH_CONFIG, default /etc/tgpush/config.ini.
+file's format: it watches a path and posts the lines that were not there last
+time, in fenced blocks split to fit Telegram's message limit. Config in $TGPUSH_CONFIG, default /etc/tgpush/config.ini.
 
 A channel and a supergroup are the same thing to MTProto - both are peers of
 type channel, both have ids of the form -100<id> - so chat_id takes either.
@@ -48,7 +48,8 @@ def load_config(path):
             "interval": watch.getint("interval", 30),
             "state": watch.get("state", "/var/lib/tgpush/state"),
             "session": watch.get("session", "/var/lib/tgpush/tgpush"),
-            "caption": watch.get("caption", "{n} working nodes - {when}"),
+            "caption": watch.get("caption",
+                                  "{n} new node(s) - {total} working - {when}"),
         }
     except (KeyError, ValueError) as e:
         sys.exit(f"{path}: {e}")
@@ -58,47 +59,60 @@ def load_config(path):
     return cfg
 
 
-def digest(path):
-    """A hash of the NODES in the file, or None if it is missing or empty.
+def ident(uri):
+    """What makes a node the same node: everything but its #tag, hashed.
 
-    Content, not mtime: refresh.sh republishes on every settled cycle whether
-    or not the survivors changed, and re-sending an identical list every half
-    hour is how a channel learns to mute you.
+    The fragment is the outbound's tag, and tags are POSITIONAL -
+    prox-<pool>-<n>, n being the node's index in the subscription. One node
+    appearing upstream renumbers every node after it. Measured against one
+    insertion into a 977-node subscription: all 964 nodes present in both
+    exports were renumbered, against 14 genuinely added. Keying on the line
+    would call all 964 of them new.
 
-    ...but not the bytes either. The #fragment on each URI is the outbound's
-    tag, and tags are POSITIONAL - prox-<pool>-<n>, n being the node's index
-    in the subscription. One node appearing upstream renumbers every node
-    after it, so the file changes on every line while the pool is the same
-    pool. Measured against one insertion into a 977-node subscription: all 964
-    nodes present in both exports were renumbered, against 14 genuinely added.
-    Hashing the bytes would have resent the whole list for that.
+    Hashed rather than kept whole so the state file, which is a list of these,
+    is not a second copy of every credential in the pool.
+    """
+    return hashlib.sha256(uri.split("#", 1)[0].encode()).hexdigest()
 
-    Sorted, so a reordered subscription is not a change either.
+
+def read_nodes(path):
+    """{identity: line} for the published list, in file order.
+
+    None when the file is missing or has nothing in it - which is not the same
+    as an empty pool, and must never be read as "everything was removed".
     """
     try:
         with open(path) as f:
             text = f.read()
     except OSError:
         return None
-    nodes = sorted(line.split("#", 1)[0] for line in text.splitlines() if line.strip())
-    if not nodes:
-        return None
-    return hashlib.sha256("\n".join(nodes).encode()).hexdigest()
+    nodes = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            nodes.setdefault(ident(line), line)
+    return nodes or None
+
+
+def newcomers(nodes, sent):
+    """The lines whose identity has not been sent before, in file order."""
+    return [uri for key, uri in nodes.items() if key not in sent]
 
 
 def read_state(path):
+    """The identities already sent. An unreadable state file means none."""
     try:
         with open(path) as f:
-            return f.read().strip() or None
+            return {line.strip() for line in f if line.strip()}
     except OSError:
-        return None
+        return set()
 
 
-def write_state(path, value):
+def write_state(path, keys):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = f"{path}.tmp"
     with open(tmp, "w") as f:
-        f.write(value + "\n")
+        f.write("".join(k + "\n" for k in sorted(keys)))
     os.replace(tmp, path)
 
 
@@ -151,12 +165,12 @@ def chunk(uris, budget=BODY_BUDGET):
     return out
 
 
-async def send(client, peer, cfg, body):
+async def send(client, peer, cfg, fresh, total):
     now = datetime.now(timezone.utc)
-    uris = [line.strip() for line in body.splitlines() if line.strip()]
-    fields = {"n": len(uris), "when": now.strftime("%Y-%m-%d %H:%M UTC"),
+    fields = {"n": len(fresh), "total": total,
+              "when": now.strftime("%Y-%m-%d %H:%M UTC"),
               "stamp": now.strftime("%Y%m%dT%H%M%SZ")}
-    parts = chunk(uris)
+    parts = chunk(fresh)
     for i, part in enumerate(parts, 1):
         head = cfg["caption"].format(**fields)
         if len(parts) > 1:
@@ -218,21 +232,25 @@ async def watch(cfg, stop):
                  f"it is a channel.")
     log.info("connected as @%s, watching %s every %ss",
              me.username, cfg["path"], cfg["interval"])
-    last = read_state(cfg["state"])
-    if last:
-        log.info("resuming from a previous send; an unchanged file is not resent")
+    sent = read_state(cfg["state"])
+    if sent:
+        log.info("resuming: %d node(s) already sent, only newcomers go out", len(sent))
     while not stop.is_set():
         try:
-            current = digest(cfg["path"])
-            if current and current != last:
-                with open(cfg["path"]) as f:
-                    body = f.read()
-                await send(client, peer, cfg, body)
-                # Only after the send lands. Recording it first would turn a
-                # failed send into a change that is never retried.
-                write_state(cfg["state"], current)
-                last = current
-                log.info("sent %d node(s)", len(body.splitlines()))
+            nodes = read_nodes(cfg["path"])
+            if nodes:
+                fresh = newcomers(nodes, sent)
+                if fresh:
+                    await send(client, peer, cfg, fresh, len(nodes))
+                    log.info("sent %d new node(s) of %d published", len(fresh), len(nodes))
+                # Only after the send lands - recording first would turn a
+                # failed send into a change that is never retried. Written even
+                # when nothing was new, because the state is WHAT IS PUBLISHED
+                # NOW, not everything ever seen: a node that drops out has to
+                # leave the set, or its return would never be announced.
+                if fresh or set(nodes) != sent:
+                    write_state(cfg["state"], set(nodes))
+                    sent = set(nodes)
         except (ChatWriteForbiddenError, ChatAdminRequiredError):
             # Never resolves on its own, so it gets the fix rather than a
             # stack trace repeated every 30 seconds. Not fatal: promoting the
@@ -256,35 +274,46 @@ def _selftest():
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "working.txt")
-        assert digest(p) is None                       # missing
+        assert read_nodes(p) is None                    # missing
         open(p, "w").write("   \n")
-        assert digest(p) is None                       # empty is not a change
-        open(p, "w").write("vless://a\n")
-        first = digest(p)
-        assert first and digest(p) == first            # stable
-        open(p, "w").write("vless://a\n")              # rewritten, same bytes
-        assert digest(p) == first, "an identical republish must not look new"
-        open(p, "w").write("vless://b\n")
-        assert digest(p) != first
-        # ⚠ Tags are positional, so one node arriving upstream renumbers every
-        # node after it. That is not a change to the pool and must not resend.
-        open(p, "w").write("vless://x@a.com:443#prox-p-7\nvless://y@b.com:443#prox-p-8\n")
-        renumbered = digest(p)
-        open(p, "w").write("vless://x@a.com:443#prox-p-8\nvless://y@b.com:443#prox-p-9\n")
-        assert digest(p) == renumbered, "a renumbered tag looked like a new list"
-        # ...nor is a reordering of the same nodes
-        open(p, "w").write("vless://y@b.com:443#prox-p-9\nvless://x@a.com:443#prox-p-8\n")
-        assert digest(p) == renumbered, "a reordered list looked like a new one"
-        # ...but a genuinely different node still is one
-        open(p, "w").write("vless://x@a.com:443#prox-p-8\nvless://z@c.com:443#prox-p-9\n")
-        assert digest(p) != renumbered
+        assert read_nodes(p) is None                    # empty is not "all gone"
 
-        s = os.path.join(d, "sub", "state")
-        assert read_state(s) is None
-        write_state(s, first)
-        assert read_state(s) == first
-        write_state(s, "second")                       # replaces, never appends
-        assert read_state(s) == "second"
+        # ⚠ Tags are positional, so one node arriving upstream renumbers every
+        # node after it. That renaming is not a new node.
+        open(p, "w").write("vless://x@a.com:443#prox-p-7\nvless://y@b.com:443#prox-p-8\n")
+        first = read_nodes(p)
+        assert len(first) == 2
+        open(p, "w").write("vless://y@b.com:443#prox-p-9\nvless://x@a.com:443#prox-p-8\n")
+        renumbered = read_nodes(p)
+        assert set(renumbered) == set(first), "a renumbered or reordered tag read as new"
+        assert newcomers(renumbered, set(first)) == [], "it would have resent both"
+        # ...and the line that goes out carries the CURRENT tag, not the old one
+        open(p, "w").write("vless://x@a.com:443#prox-p-1\nvless://z@c.com:443#prox-p-2\n")
+        nodes = read_nodes(p)
+        assert newcomers(nodes, set(first)) == ["vless://z@c.com:443#prox-p-2"]
+
+        # ⚠ The state is what is published NOW, never everything ever seen. A
+        # node that drops out has to leave the set, or its return is silent -
+        # and nodes drop out of these pools constantly.
+        gone = {k: v for k, v in first.items()}
+        state = set(gone)
+        open(p, "w").write("vless://x@a.com:443#prox-p-1\n")     # y disappears
+        shrunk = read_nodes(p)
+        assert newcomers(shrunk, state) == [], "a removal is not an announcement"
+        state = set(shrunk)                                       # ...but it updates
+        open(p, "w").write("vless://x@a.com:443#prox-p-1\nvless://y@b.com:443#prox-p-2\n")
+        assert newcomers(read_nodes(p), state) == ["vless://y@b.com:443#prox-p-2"], \
+            "a node that came back was never announced"
+
+        # a first run has nothing to compare against, so everything is new
+        assert len(newcomers(read_nodes(p), set())) == 2
+
+        st = os.path.join(d, "sub", "state")
+        assert read_state(st) == set()
+        write_state(st, {"aa", "bb"})
+        assert read_state(st) == {"aa", "bb"}
+        write_state(st, {"cc"})                        # replaces, never appends
+        assert read_state(st) == {"cc"}
 
     # ⚠ Split, never truncated, and never mid-URI: half a node is a node that
     # looks usable and is not.

@@ -124,7 +124,9 @@ That leaves port 22 alone. In `selective` mode it still goes direct, because ssh
 
 **`pool` and `export` drop repeated entries**, keyed on the whole outbound bar its tag - so one server offered over two transports stays two entries. Both say how many collapsed, which is why a settled pool of 13 can publish 5.
 
-**The bot posts the nodes as text, in fenced blocks.** Copyable, with no file to download - and split across several messages when the list passes Telegram's 4096-character limit, which a pool does at about seventeen nodes. The split is between URIs, never inside one.
+**The bot posts only what is new**, as text in fenced blocks - copyable, with no file to download. The first run has nothing to compare against and sends the whole list once. Long batches are split across messages at Telegram's 4096-character limit, between URIs and never inside one.
+
+Nodes are compared with their `#tag` stripped, because tags are positional: one node arriving upstream renumbers every node after it, and hashing the file would call all of them new. What it remembers is what is published *now*, not everything ever seen, so a node that drops out and comes back is announced again.
 
 **The bot reaches Telegram through the pool, not around it.** Its container sits on a docker bridge, prerouting captures it like everything else, and `geoip:telegram` routes to the balancer - which is what you want, since Telegram direct is usually the blocked path. But it means the publisher cannot connect while the pool is down, and every refresh cycle restarts xray underneath it. It retries with a backoff rather than exiting; `cannot reach Telegram` in its log points at the pool, not at the bot.
 
