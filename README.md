@@ -128,6 +128,8 @@ Run `sub2xray.py`, `alive.sh` and `wg-peer.sh` from the clone, with `XRAY_CONFDI
 | `10-routing.json` | `sub2xray init` | dns, outbounds, observatory, the `lb` balancer, the rules |
 | `50-pool-<name>-NN.json` | `sub2xray pool` | outbounds for one subscription, chunked |
 | `domains.txt` | **you** | which destinations are proxied, one matcher per line |
+| `/etc/xray/subscriptions.txt` | **you** | `<pool-name> <url>` per line, read by `refresh.sh` |
+| `/var/lib/xray/working.txt` | `refresh.sh` | the last settled export, republished on every cycle |
 
 All inside `$XRAY_CONFDIR`, default `conf` in the current directory, `/etc/xray/conf` once installed.
 `sub2xray --outdir` and `wg-peer`'s `XRAY_CONF` override individually.
@@ -433,6 +435,86 @@ An outbound with no URI form at all - a hand-added `freedom` in a `60-manual.jso
 
 > The export is only as current as the last prune.
 > Report-only runs change nothing, so `./alive.sh` without `--prune` leaves the dead in the pool and therefore in the export.
+
+## Running it on a schedule
+
+`refresh.sh` is the whole loop in one command: fetch every subscription, restart, prune until the pool stops reporting failures, publish the survivors.
+
+```sh
+sudo ./install.sh                       # links /usr/local/bin/xray-refresh, seeds the list
+sudoedit /etc/xray/subscriptions.txt    # <pool-name> <url>, one per line
+sudo systemctl enable --now xray-refresh.timer
+journalctl -fu xray-refresh
+```
+
+Cron works too - the script locks itself, so an overlapping run is a no-op:
+
+```
+*/30 * * * * /usr/local/bin/xray-refresh >> /var/log/xray-refresh.log 2>&1
+```
+
+The timer is still the better option on a box that already runs xray under systemd: `OnUnitInactiveSec` measures the interval from when the last cycle **finished**, which matters because a cycle waits for the pool to go quiet and can legitimately take half an hour.
+
+### The cycle
+
+| step | what happens |
+|---|---|
+| 1 | each subscription is fetched and written to its own pool. A fetch that fails, returns nothing, or parses to nothing leaves the pool already on disk alone |
+| 2 | `xray -test`, then `systemctl restart xray xray-nftables` |
+| 3 | every `REFRESH_EVERY` (30s), `alive.sh --prune`. If it deleted anything, restart and reset the clock. When nothing has failed for `REFRESH_QUIET` (5 min), it is settled |
+| 4 | `sub2xray.py export` to `$REFRESH_OUT`, written to a temp file in the same directory and renamed over the target |
+
+Knobs are environment variables, listed in `./refresh.sh --help`. `./refresh.sh selftest` runs the whole cycle against stubbed `systemctl`, `curl`, `journalctl` and `xray` - no service, no network.
+
+**The prune window is "since the last restart", never a fixed `-5m`.**
+A restart bursts every probe at once, so the failures that matter arrive immediately after it.
+A fixed window keeps re-reading the failures of nodes that were pruned two restarts ago and the loop never goes quiet.
+
+**Every prune is followed by a restart.**
+The running service keeps its old config, so without one it goes on dialling the nodes just deleted and goes on logging them as failures - which reads as a pool that never settles.
+
+**`xray -test` runs before every restart.**
+Bringing the capture up against a config xray will not load tproxies every packet at a port with nothing behind it, which takes the host off the network. `install.sh` guards the first start this way; this is the same gate on every later one.
+
+**Nothing is published unless the cycle settles.**
+If the loop hits `REFRESH_MAX` still churning, or `alive.sh` refuses the prune because `ALIVE_MIN` would be breached, `$REFRESH_OUT` is left exactly as it was and the script exits non-zero - visible as a failed unit, rather than quietly publishing a list already known to be dead.
+
+**The services are not stopped for the refresh.**
+`pool` only writes files and xray does not watch the confdir, so the host keeps its proxy until the restart in step 2.
+Pruning *before* a refresh would also be dead work: `pool` rewrites that pool's files wholesale a second later, so anything the prune deleted comes straight back.
+
+> ⚠ `$REFRESH_OUT` is every surviving node's uuid or password in plain text.
+> It is written `0600`, and `subscriptions.txt` and `working.txt` are gitignored.
+
+## Telegram: publishing the list to a group
+
+`telegram/` is a container that watches `$REFRESH_OUT` and sends it to one chat whenever the contents change.
+
+```sh
+cd telegram
+cp config.ini.example config.ini    # api_id, api_hash, bot_token, chat_id
+docker compose up -d
+docker compose logs -f
+```
+
+`api_id`/`api_hash` come from [my.telegram.org](https://my.telegram.org); Telethon needs them even for a bot, because they identify the client rather than the account. The token comes from `@BotFather`, and the bot has to be a member of the group - it needs no admin rights unless the group restricts who may post.
+
+**It hashes the contents, not the mtime.**
+`refresh.sh` republishes on every settled cycle whether or not the survivors changed, and re-sending an identical list every half hour is how a group learns to mute you.
+The last-sent hash lives on a named volume beside the session, so a container restart neither re-authenticates nor re-sends what it already sent.
+
+**It polls rather than using inotify.**
+The publish is a rename over the path, which replaces the inode - an inotify watch follows the old one and silently never fires again.
+
+**It always sends a file, never a message.**
+A pool is past the 4096-character message limit at about 30 nodes, and a file is what the other end imports anyway.
+
+**The `chat_id` is turned into a peer arithmetically** (`-100…` is a supergroup, a bare negative is a basic group, positive is a user) rather than looked up. A bot's session starts empty and bots cannot enumerate their dialogs, so `get_entity()` on a group it was merely added to fails. The id is resolved once at startup, so a wrong one is an immediate exit with the reason rather than a watcher that looks healthy until the moment it has a job to do.
+
+`python3 telegram/bot.py selftest` checks the change detection and the peer arithmetic with no config and no network.
+
+> ⚠ This publishes credentials to everyone in that group, and nothing here can un-send them.
+> The container runs as root purely so it can read the `0600` list; it drops every capability, gets a read-only root filesystem, and mounts the list read-only.
 
 ## wireguard peers
 

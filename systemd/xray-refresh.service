@@ -1,0 +1,23 @@
+[Unit]
+Description=Refresh the xray pool from subscriptions and publish what answers
+Documentation=file:/usr/local/bin/xray-refresh
+Wants=network-online.target
+After=network-online.target xray.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xray-refresh
+# The cycle deliberately outlives a short interval: it restarts the pool and
+# then waits for it to stop reporting failures. Cap it above REFRESH_MAX so the
+# script's own give-up path runs and reports, rather than systemd killing it
+# mid-restart with the capture half configured.
+TimeoutStartSec=45min
+
+# It rewrites the confdir and restarts the services, so it needs root - but
+# nothing beyond the two directories it owns.
+ReadWritePaths=/etc/xray /var/lib/xray
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,30 @@
+services:
+  tgpush:
+    build: .
+    container_name: xray-tgpush
+    restart: unless-stopped
+
+    # Runs as root inside the container for one reason: refresh.sh writes the
+    # node list 0600 root-owned because every line of it is a credential, and a
+    # uid that cannot read it is a watcher that silently never sends. Nothing
+    # else is granted - no capabilities, no privilege escalation, and the root
+    # filesystem is read-only.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+
+    volumes:
+      - ./config.ini:/etc/tgpush/config.ini:ro
+      # Read-only: this container publishes the list, it never edits it.
+      - /var/lib/xray:/var/lib/xray:ro
+      # The session and the last-sent hash. Without a volume here the bot
+      # re-authenticates and re-sends the current list on every restart.
+      - tgpush-state:/var/lib/tgpush
+
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+volumes:
+  tgpush-state:

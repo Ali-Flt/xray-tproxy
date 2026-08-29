@@ -1,0 +1,17 @@
+[Unit]
+Description=Refresh the xray pool on a schedule
+
+[Timer]
+# OnUnitInactiveSec, not OnCalendar: the interval is measured from when the
+# last cycle FINISHED. A cycle waits for the pool to go quiet and can run for
+# half an hour, so a fixed schedule would queue runs on top of each other -
+# the script's flock would then turn every second one into a no-op.
+OnBootSec=5min
+OnUnitInactiveSec=30min
+# Free public pools are shared; do not have every installation of this hit the
+# same subscription URLs on the same minute.
+RandomizedDelaySec=3min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

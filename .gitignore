@@ -5,3 +5,10 @@ conf/
 subs/
 __pycache__/
 alive-probe.log
+# The subscription list: the urls are usually accounts.
+subscriptions.txt
+# What refresh.sh publishes: every surviving node's uuid or password.
+working.txt
+# The bot's token, and its session.
+telegram/config.ini
+telegram/*.session

@@ -1,0 +1,17 @@
+# One subscription per line:  <pool-name> <url>
+#
+# The name namespaces that subscription's outbound tags and its pool files
+# (50-pool-<name>-NN.json), so two subscriptions must never share one: -confdir
+# merges by tag and a duplicate tag is silently overwritten, one node quietly
+# gone. Re-running a pool removes that pool's old files first, so a subscription
+# that shrank cannot leave stale chunks behind.
+#
+# Blank lines and # comments are ignored. Names may not contain whitespace.
+#
+# REFRESH_LIMIT (default 150) caps each one. That cap is per subscription and
+# the observatory probes the TOTAL, concurrently, every interval - so four
+# subscriptions at 150 is 600 nodes probed every 3 minutes, which is the point
+# at which the balancer stops converging and looks like it is full of bad
+# nodes. sub2xray prints the arithmetic when the total passes 200.
+
+radikal_secure  https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/secure/configs.txt

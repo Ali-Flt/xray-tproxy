@@ -1,0 +1,32 @@
+# Copy to config.ini and fill in. config.ini is gitignored: it holds a bot
+# token, which is the bot.
+
+[telegram]
+# my.telegram.org -> API development tools. Telethon needs these even for a
+# bot; they identify the client, not the account.
+api_id =
+api_hash =
+
+# @BotFather -> /newbot. Then add the bot to the group; it needs no admin
+# rights to post, but if the group has "Restrict members" on, it does.
+bot_token =
+
+# The group. A supergroup looks like -1001234567890, a basic group like
+# -987654321. Forward any message from the group to @JsonDumpBot to read it,
+# or add @RawDataBot to the group for a moment.
+chat_id =
+
+[watch]
+# What refresh.sh publishes. Must match REFRESH_OUT, and be mounted in.
+path = /var/lib/xray/working.txt
+# Seconds between checks. Content-hashed, so an unchanged republish is quiet.
+interval = 30
+
+# Both live on the named volume, so a container restart neither re-authenticates
+# nor re-sends the list it already sent.
+state = /var/lib/tgpush/state
+session = /var/lib/tgpush/tgpush
+
+# {n} nodes, {when} human time, {stamp} a filename-safe UTC timestamp.
+caption = {n} working nodes - {when}
+filename = nodes-{stamp}.txt

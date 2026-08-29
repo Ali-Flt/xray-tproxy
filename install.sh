@@ -69,6 +69,23 @@ put() {   # put <src> <dst> - never clobber without --force-units
 put nftables.conf                 /etc/xray/nftables.conf
 put systemd/xray.service          /usr/lib/systemd/system/xray.service
 put systemd/xray-nftables.service /usr/lib/systemd/system/xray-nftables.service
+put systemd/xray-refresh.service  /usr/lib/systemd/system/xray-refresh.service
+put systemd/xray-refresh.timer    /usr/lib/systemd/system/xray-refresh.timer
+
+# A symlink rather than a copy: refresh.sh calls alive.sh and sub2xray.py from
+# its own directory, which `readlink -f` resolves back to this checkout even
+# when it is started through the link. So the unit gets a fixed ExecStart and
+# the repo stays the one place the scripts live - but it also has to stay where
+# it is, or the link dangles.
+ln -sfn "$PWD/refresh.sh" /usr/local/bin/xray-refresh
+echo "linked /usr/local/bin/xray-refresh -> $PWD/refresh.sh"
+install -d -m 0755 /var/lib/xray
+if [[ ! -e /etc/xray/subscriptions.txt ]]; then
+  install -m 0644 subscriptions.txt.example /etc/xray/subscriptions.txt
+  echo "wrote  /etc/xray/subscriptions.txt (edit it, then: systemctl enable --now xray-refresh.timer)"
+else
+  echo "kept   /etc/xray/subscriptions.txt"
+fi
 
 systemctl daemon-reload
 
