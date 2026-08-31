@@ -153,18 +153,43 @@ def b64d(s):
     return base64.b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", "replace")
 
 
+def url_path(path):
+    """A path xray can build a request URL from, or a refusal.
+
+    ⚠ XHTTP does not validate this at load - it dereferences it at DISPATCH.
+    splithttp's OpenStream builds the request with http.NewRequestWithContext
+    and DOES NOT CHECK THE ERROR (client.go:63), so a URL Go cannot parse
+    yields a nil *http.Request that FillStreamRequest dereferences on its first
+    line. That is a SIGSEGV taking the whole process down, on some connection
+    hours after `xray -test` passed - which is why this is refused here, the
+    way hysteria's missing address is: nothing downstream gets another chance.
+    Verified against 26.3.27.
+
+    Go's url.Parse rejects exactly two things, so those are what this checks:
+    ASCII control bytes, and a % that is not followed by two hex digits.
+    """
+    if not path.startswith("/"):
+        raise ValueError(f"path {path!r} does not start with /")
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in path):
+        raise ValueError(f"path {path!r} has a control character")
+    if re.search(r"%(?![0-9A-Fa-f]{2})", path):
+        raise ValueError(f"path {path!r} has an invalid percent-escape")
+    return path
+
+
 def stream(net, security, sni, host, path, service, fp, pbk, sid):
     """Shared streamSettings - identical between vless and vmess."""
     ss = {"network": net, "security": security, "sockopt": dict(SOCKOPT)}
     if net == "ws":
-        ss["wsSettings"] = {"path": path or "/", "headers": {"Host": host or sni}}
+        ss["wsSettings"] = {"path": url_path(path or "/"),
+                            "headers": {"Host": host or sni}}
     elif net == "grpc":
         ss["grpcSettings"] = {"serviceName": service}
     elif net == "xhttp":
         # XHTTP (formerly HTTP transport): needs a path, defaults to /.
         # host is optional — if absent, serverName is used.
         ss["xhttpSettings"] = {
-            "path": path or "/",
+            "path": url_path(path or "/"),
             "host": host or sni,
         }
     # tcp needs nothing extra
@@ -185,7 +210,11 @@ def parse_vless(uri, tag):
     # HTTP transport was removed and migrated to XHTTP. Convert type=http →
     # type=xhttp so the node survives. XHTTP needs a path (defaults to /).
     net = q.get("type", "tcp")
-    if net == "http":
+    # splithttp is xhttp under its old name; both are the same transport, and
+    # normalising here is what gets it a settings block at all - left as
+    # "splithttp" it matched no branch in stream() and the node went out with
+    # no transport config, which is the other way to reach a nil dereference.
+    if net in ("http", "splithttp"):
         net = "xhttp"
     if net not in ("tcp", "ws", "grpc", "xhttp", "kcp", "quic", "h2", "raw", "httpupgrade", "splithttp"):
         raise ValueError(f"vless unknown transport: {net!r}")
@@ -206,7 +235,7 @@ def parse_vless(uri, tag):
         }]},
         "streamSettings": stream(
             net, security, sni,
-            q.get("host", ""), unquote(q.get("path", "/")),
+            q.get("host", ""), q.get("path", "/"),
             q.get("serviceName", ""), q.get("fp", ""),
             q.get("pbk", ""), q.get("sid", "")),
     }
@@ -229,7 +258,11 @@ def parse_trojan(uri, tag):
     host, _, port = hostport.rpartition(":")
     sni = q.get("sni", host)
     net = q.get("type", "tcp")
-    if net == "http":
+    # splithttp is xhttp under its old name; both are the same transport, and
+    # normalising here is what gets it a settings block at all - left as
+    # "splithttp" it matched no branch in stream() and the node went out with
+    # no transport config, which is the other way to reach a nil dereference.
+    if net in ("http", "splithttp"):
         net = "xhttp"
     if net not in ("tcp", "ws", "grpc", "xhttp", "kcp", "quic", "h2", "raw", "httpupgrade", "splithttp"):
         raise ValueError(f"trojan unknown transport: {net!r}")
@@ -250,7 +283,7 @@ def parse_trojan(uri, tag):
         }]},
         "streamSettings": stream(
             net, security, sni,
-            q.get("host", ""), unquote(q.get("path", "/")),
+            q.get("host", ""), q.get("path", "/"),
             q.get("serviceName", ""), q.get("fp", ""),
             q.get("pbk", ""), q.get("sid", "")),
     }
@@ -264,7 +297,7 @@ def parse_vmess(uri, tag):
     c = json.loads(b64d(uri[len("vmess://"):].split("#", 1)[0]))
     sni = c.get("sni") or c.get("host") or c.get("add")
     net = c.get("net", "tcp")
-    if net == "http":
+    if net in ("http", "splithttp"):
         net = "xhttp"
     if net not in ("tcp", "ws", "grpc", "xhttp", "kcp", "quic", "h2", "http", "splithttp", "raw", "httpupgrade", "mKCP", "reality"):
         raise ValueError(f"vmess unknown transport: {net!r}")
@@ -1176,6 +1209,57 @@ def _selftest():
             parse(bad, "t"); assert False, f"{bad} should have been refused"
         except ValueError:
             pass
+
+    # ---- a path xray cannot put in a URL is refused, not emitted --------
+    # ⚠ splithttp's OpenStream does not check the error from
+    # http.NewRequestWithContext, so a URL Go cannot parse becomes a nil
+    # *http.Request that FillStreamRequest dereferences: SIGSEGV at DISPATCH,
+    # hours after xray -test passed. One node in the pool takes the proxy down.
+    assert url_path("/api/v1") == "/api/v1"
+    assert url_path("/a%2Fb") == "/a%2Fb"          # a VALID escape is fine
+    for bad in ("/a%zz", "/a%2", "/a%"):           # url.Parse: invalid escape
+        try:
+            url_path(bad); assert False, f"{bad} should have been refused"
+        except ValueError as e:
+            assert "percent-escape" in str(e), e
+    try:
+        url_path("/a\tb"); assert False, "a control character should be refused"
+    except ValueError as e:
+        assert "control character" in str(e), e
+    try:
+        url_path("noslash"); assert False, "a relative path should be refused"
+    except ValueError:
+        pass
+    # ...and the refusal reaches build(), which names it rather than emitting it
+    buf, old = io.StringIO(), sys.stderr
+    sys.stderr = buf
+    try:
+        kept = build("vless://u@a.com:443?type=xhttp&path=%2Fa%25zz#bad\n"
+                     "vless://u@b.com:443?type=xhttp&path=%2Fok#good", "p")["outbounds"]
+    finally:
+        sys.stderr = old
+    assert [o["settings"]["vnext"][0]["address"] for o in kept] == ["b.com"], kept
+    assert "percent-escape" in buf.getvalue(), buf.getvalue()
+
+    # ⚠ parse_qs ALREADY decodes. The second unquote decoded again, turning
+    # %2520 into a literal space and %25zz into that invalid escape - this
+    # parser was manufacturing the input that crashed xray.
+    once = parse("vless://u@a.com:443?type=ws&path=%2Fa%2520b", "t")
+    assert once["streamSettings"]["wsSettings"]["path"] == "/a%20b", \
+        "the path was decoded twice; %2520 became a literal space"
+    # ...and a path that decodes to something that is not a path at all is
+    # refused rather than handed over as a relative URL.
+    try:
+        parse("vless://u@a.com:443?type=ws&path=%252Fa", "t")
+        assert False, "should have been refused"
+    except ValueError as e:
+        assert "does not start with /" in str(e), e
+
+    # splithttp is xhttp's old name. Left alone it matched no branch in
+    # stream() and the node went out with no transport settings at all.
+    sp = parse("vless://u@a.com:443?type=splithttp&path=%2Fp&host=h.com", "t")
+    assert sp["streamSettings"]["network"] == "xhttp", sp["streamSettings"]
+    assert sp["streamSettings"]["xhttpSettings"]["path"] == "/p"
 
     # ---- dedupe keys on the CONFIGURATION, not the server ---------------
     # Same host, same credential, different transport. node_id cannot tell
