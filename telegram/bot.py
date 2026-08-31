@@ -31,6 +31,29 @@ CONFIG = os.environ.get("TGPUSH_CONFIG", "/etc/tgpush/config.ini")
 log = logging.getLogger("tgpush")
 
 
+# How long a health probe waits for Telegram before the pool is called
+# unreachable. Short: it is a round trip to a datacentre, not a download.
+HEALTH_TIMEOUT = 10
+
+
+def setup_logging():
+    """INFO for this bot, WARNING for telethon.
+
+    ⚠ Telethon logs every reconnect at INFO, and it reconnects on a 60-second
+    keepalive whenever the pool cannot hold an idle connection - which for a
+    pool of free nodes is most of the time. That is one line a minute, for
+    ever, burying the handful that say what this bot actually did.
+
+    Turning the library down removes the only visible sign that the pool is
+    unreachable, so watch() probes for that itself and says so in its own
+    words. Silencing a symptom without replacing it would just move the
+    outage from noisy to invisible.
+    """
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+
+
 def load_config(path):
     """Read the ini, and fail at startup rather than at the first send."""
     if not os.path.exists(path):
@@ -241,8 +264,25 @@ async def watch(cfg, stop):
     # changed" - forever, with nothing in the log to say otherwise. Said once
     # when it starts and once when it stops, not every tick.
     unreadable = False
+    # Paired with setup_logging() turning telethon down: with its reconnect
+    # chatter gone, this is the only thing left that can say the pool has
+    # stopped carrying the connection. Once when it breaks, once when it
+    # comes back - and the round trip doubles as a keepalive.
+    reachable = True
     while not stop.is_set():
         try:
+            try:
+                await asyncio.wait_for(client.get_me(), HEALTH_TIMEOUT)
+                if not reachable:
+                    log.info("Telegram is reachable again")
+                    reachable = True
+            except Exception as e:
+                if reachable:
+                    log.warning("cannot reach Telegram (%s: %s). This container "
+                                "goes out through the xray pool - check it is "
+                                "carrying traffic. Sends will be retried.",
+                                type(e).__name__, e)
+                    reachable = False
             nodes = read_nodes(cfg["path"])
             if not nodes:
                 if not unreadable:
@@ -378,12 +418,22 @@ def _selftest():
     assert newcomers({}, keys_before) == []
     assert set(both) != keys_before
 
+    # ⚠ The reconnect churn comes from telethon's own logger, not this one, so
+    # turning down the root would have silenced the bot's sends along with it.
+    # The child logger is the one that actually emits "Closing current
+    # connection to begin reconnect...", so that is what gets asserted.
+    setup_logging()
+    assert logging.getLogger("telethon").getEffectiveLevel() == logging.WARNING
+    assert logging.getLogger("telethon.network.mtprotosender") \
+        .getEffectiveLevel() == logging.WARNING
+    assert log.getEffectiveLevel() == logging.INFO, \
+        "the bot's own INFO lines are what the log is for; they must survive"
+
     print("selftest ok")
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
+    setup_logging()
     if sys.argv[1:] == ["selftest"]:
         _selftest()
         sys.exit(0)
