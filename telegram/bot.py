@@ -50,6 +50,13 @@ HEALTH_TIMEOUT = 10
 # returns, so the alternative to a duplicate is a node that is never announced.
 SEND_TIMEOUT = 60
 
+# The same ceiling on the three calls that make up startup. Unbounded, they
+# are worse than a slow send: nothing is logged until all three return, so a
+# startup wedged against a pool that accepts the TCP connection locally and
+# then carries nothing produces an EMPTY log for ever - a container that is
+# "Up" with not one line to say what it is waiting for.
+CONNECT_TIMEOUT = 30
+
 
 def setup_logging():
     """INFO for this bot, WARNING for telethon.
@@ -247,9 +254,37 @@ async def watch(cfg, stop):
     # Exiting on that hands a full traceback to Docker's restart policy once a
     # minute, for a condition that resolves itself.
     delay = cfg["interval"]
+    me = peer = None
+    # ⚠ Said BEFORE the first attempt, not after it succeeds. Everything below
+    # can block, and until this line existed the whole startup was silent: a
+    # container that is "Up" and has never printed anything is indistinguishable
+    # from one that never ran, and neither tells you it is waiting on the pool.
+    log.info("connecting to Telegram through the xray pool...")
     while not stop.is_set():
         try:
-            await client.start(bot_token=cfg["bot_token"])
+            # All three bounded. A tproxy inbound accepts the connection
+            # locally in a millisecond whatever the pool is doing, so telethon
+            # believes it is connected and then retries a request that will
+            # never be answered - for minutes, silently, with no ceiling of
+            # its own.
+            await asyncio.wait_for(client.start(bot_token=cfg["bot_token"]),
+                                   CONNECT_TIMEOUT)
+            me = await asyncio.wait_for(client.get_me(), CONNECT_TIMEOUT)
+            # Resolved once, at startup, rather than on the first change. A
+            # wrong id or a bot that was never added to the group is otherwise
+            # a watcher that looks healthy for hours and then fails at the only
+            # moment it had a job to do.
+            try:
+                peer = await asyncio.wait_for(
+                    client.get_input_entity(to_peer(cfg["chat_id"])),
+                    CONNECT_TIMEOUT)
+            except (ValueError, TypeError) as e:
+                # SystemExit is not an Exception, so this is not swallowed by
+                # the retry below - a wrong chat_id never fixes itself.
+                sys.exit(f"cannot resolve chat_id {cfg['chat_id']}: {e}\n"
+                         f"Check the id (a channel or supergroup starts -100), "
+                         f"and that @{me.username} has been added to it - as an "
+                         f"administrator if it is a channel.")
             break
         except Exception as e:
             log.warning("cannot reach Telegram (%s: %s); retrying in %ss. This "
@@ -259,17 +294,6 @@ async def watch(cfg, stop):
             delay = min(delay * 2, 300)     # backoff, capped at five minutes
     if stop.is_set():
         return
-    me = await client.get_me()
-    # Resolved once, at startup, rather than on the first change. A wrong id or
-    # a bot that was never added to the group is otherwise a watcher that looks
-    # healthy for hours and then fails at the only moment it had a job to do.
-    try:
-        peer = await client.get_input_entity(to_peer(cfg["chat_id"]))
-    except (ValueError, TypeError) as e:
-        sys.exit(f"cannot resolve chat_id {cfg['chat_id']}: {e}\n"
-                 f"Check the id (a channel or supergroup starts -100), and that "
-                 f"@{me.username} has been added to it - as an administrator if "
-                 f"it is a channel.")
     log.info("connected as @%s, watching %s every %ss",
              me.username, cfg["path"], cfg["interval"])
     sent = read_state(cfg["state"])
