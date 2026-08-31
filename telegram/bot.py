@@ -235,20 +235,45 @@ async def watch(cfg, stop):
     sent = read_state(cfg["state"])
     if sent:
         log.info("resuming: %d node(s) already sent, only newcomers go out", len(sent))
+    # ⚠ An unreadable list used to be indistinguishable from a quiet one: both
+    # took the same silent branch, so a wrong path, an unmounted volume or a
+    # 0600 file the container cannot open looked exactly like "nothing has
+    # changed" - forever, with nothing in the log to say otherwise. Said once
+    # when it starts and once when it stops, not every tick.
+    unreadable = False
     while not stop.is_set():
         try:
             nodes = read_nodes(cfg["path"])
-            if nodes:
+            if not nodes:
+                if not unreadable:
+                    log.warning("%s is missing, empty or unreadable - nothing "
+                                "can be published until it appears. refresh.sh "
+                                "only rewrites it when a cycle SETTLES.",
+                                cfg["path"])
+                    unreadable = True
+            else:
+                if unreadable:
+                    log.info("%s is readable again: %d node(s)",
+                             cfg["path"], len(nodes))
+                    unreadable = False
                 fresh = newcomers(nodes, sent)
+                changed = set(nodes) != sent
                 if fresh:
                     await send(client, peer, cfg, fresh, len(nodes))
                     log.info("sent %d new node(s) of %d published", len(fresh), len(nodes))
+                elif changed:
+                    # Nodes left and none arrived. Worth a line: otherwise a
+                    # shrinking pool is as quiet as a stable one. A pure tag
+                    # renumbering does NOT reach here - identities ignore the
+                    # #tag, which is the whole point of ident().
+                    log.info("published list is down to %d node(s); nothing new "
+                             "to send", len(nodes))
                 # Only after the send lands - recording first would turn a
                 # failed send into a change that is never retried. Written even
                 # when nothing was new, because the state is WHAT IS PUBLISHED
                 # NOW, not everything ever seen: a node that drops out has to
                 # leave the set, or its return would never be announced.
-                if fresh or set(nodes) != sent:
+                if fresh or changed:
                     write_state(cfg["state"], set(nodes))
                     sent = set(nodes)
         except (ChatWriteForbiddenError, ChatAdminRequiredError):
@@ -332,6 +357,27 @@ def _selftest():
     assert peer_kind(-1001234567890) == ("channel", 1234567890)
     assert peer_kind(-987654321) == ("chat", 987654321)
     assert peer_kind(12345) == ("user", 12345)
+    # ⚠ THE CASE THAT LOOKS LIKE A BUG. Every refresh cycle rebuilds the pool
+    # and renumbers the tags, so the published FILE changes on every publish
+    # while the nodes in it are the same nodes. ident() strips the #tag exactly
+    # so that is not mistaken for new arrivals - the bot going quiet here is
+    # correct, not broken.
+    before = "vless://u1@a.example:443?security=tls#prox-solispirit-7"
+    after  = "vless://u1@a.example:443?security=tls#prox-solispirit-142"
+    keys_before = {ident(before)}
+    assert newcomers({ident(after): after}, keys_before) == [], \
+        "a renumbered tag was mistaken for a new node"
+    assert set({ident(after): after}) == keys_before, \
+        "renumbering changed the identity set, so state would be rewritten"
+
+    # ...whereas a node that genuinely arrives is new, and one that leaves
+    # changes the set without anything being new.
+    other = "vless://u2@b.example:443?security=tls#prox-x-1"
+    both = {ident(before): before, ident(other): other}
+    assert newcomers(both, keys_before) == [other]
+    assert newcomers({}, keys_before) == []
+    assert set(both) != keys_before
+
     print("selftest ok")
 
 
