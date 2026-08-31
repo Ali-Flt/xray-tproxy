@@ -90,7 +90,9 @@ Every script has `--help` and a hermetic `selftest` that needs no service and no
 | `--loglevel` | `warning` | `error` and `none` leave `alive.sh` nothing to read; `debug` adds proof of life |
 | `--access-log` | `none` | not affected by `--loglevel`; unset means stdout, which journald keeps |
 
-`refresh.sh --help` lists its environment: `REFRESH_QUIET`, `REFRESH_EVERY`, `REFRESH_MAX`, `REFRESH_LIMIT`, `REFRESH_SIZE`, `REFRESH_FETCH_USER`, `REFRESH_OUT`, `ALIVE_MIN`.
+`refresh.sh --help` lists its environment: `REFRESH_QUIET`, `REFRESH_EVERY`, `REFRESH_MAX`, `REFRESH_LIMIT`, `REFRESH_SIZE`, `REFRESH_FETCH_USER`, `REFRESH_XHTTP`, `REFRESH_OUT`, `ALIVE_MIN`.
+
+**xhttp/splithttp nodes are excluded by default.** They segfault xray 26.3.27 at *dispatch* - `req, _ := http.NewRequestWithContext(...)` discards the error, so a URL Go cannot parse becomes a nil `*http.Request` that `FillStreamRequest` dereferences. `xray -test` cannot catch it and one node takes the whole proxy down. Fixed upstream after that release: on a newer build, `REFRESH_XHTTP=1` (or `pool --xhttp`) puts them back, at about 3% of a subscription.
 
 ## Gotchas
 
