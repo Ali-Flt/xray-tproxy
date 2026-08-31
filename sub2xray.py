@@ -162,14 +162,28 @@ def b64d(s):
 # taking the whole proxy with it - and under Restart=on-failure, looping. One
 # confdir logged 122 restarts.
 #
-# Refused rather than guarded because the trigger is NOT characterised: the URL
-# in the crashing frame was an ordinary 29-character https://host:port/, so it
-# is not simply a malformed path. Until it is understood no subset of xhttp
-# nodes can be called safe, and this repo's rule for a node that can panic xray
-# is the one already applied to hysteria v1: refuse it here, because nothing
-# downstream gets another chance.
+# FIXED UPSTREAM, and the mechanism is confirmed by diffing the two versions of
+# transport/internet/splithttp/client.go:
 #
-# It costs about 3% of a subscription. `pool --xhttp` puts it back.
+#   d2758a0   req, _ := http.NewRequestWithContext(...)   <- error DISCARDED
+#             c.transportConfig.FillStreamRequest(req, ...)
+#
+#   main      req, err := http.NewRequestWithContext(...)
+#             if err != nil { ...; return nil, nil, nil, err }
+#             c.transportConfig.FillStreamRequest(req, ...)
+#
+# So a URL Go cannot parse yields a nil *http.Request that 26.3.27 hands
+# straight to FillStreamRequest, which dereferences it on its first line.
+#
+# Refused rather than guarded because WHICH urls are unparseable is still not
+# characterised - url_path below rejects everything net/url documents as
+# invalid and a crashing node got through anyway - so on an affected build no
+# subset of xhttp nodes can be called safe. This repo's rule for a node that
+# can panic xray is hysteria v1's: refuse it here, because nothing downstream
+# gets another chance.
+#
+# It costs about 3% of a subscription. On a build newer than 26.3.27, where the
+# error is checked, `pool --xhttp` puts them back.
 ALLOW_XHTTP = False
 
 
@@ -1733,7 +1747,9 @@ if __name__ == "__main__":
                         help="include xhttp/splithttp nodes. Off by default: "
                              "they segfault xray 26.3.27 at DISPATCH, which "
                              "xray -test cannot catch and which takes the whole "
-                             "proxy down on whichever connection picks one.")
+                             "proxy down on whichever connection picks one. "
+                             "Fixed upstream after 26.3.27 - safe to enable on "
+                             "a newer xray.")
     p_pool.add_argument("--size", type=int, default=0, metavar="N",
                         help="nodes per file; 0 (default) puts them all in one")
     p_pool.add_argument("--limit", type=int, default=0, metavar="N",
