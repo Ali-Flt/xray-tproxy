@@ -39,7 +39,7 @@ To remove it: `sudo ./uninstall.sh` stops the services and unloads the capture, 
 
 Every 30 minutes, measured from when the last cycle **finished**:
 
-1. fetch each subscription as the `xray` user, so the fetch is not captured and cannot be blackholed by the dead pool it is replacing. A failed fetch is retried through the proxy, then leaves the pool on disk alone
+1. set the old pool files aside, then fetch each subscription as the `xray` user, so the fetch is not captured and cannot be blackholed by the dead pool it is replacing. A failed fetch is retried through the proxy, then drops that subscription's nodes for the cycle. **Each cycle keeps only what it fetched itself**, so a subscription you remove from `subscriptions.txt` stops costing probe budget; if *nothing* answers, the previous pool is put back rather than left empty
 2. `xray -test`, then restart `xray` and `xray-nftables`
 3. every 30s, `alive.sh --prune`; if it deleted anything, restart and reset the clock. Settled when nothing has failed for 5 minutes
 4. export the survivors to `/var/lib/xray/working.txt`

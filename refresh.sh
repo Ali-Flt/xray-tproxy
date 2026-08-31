@@ -13,7 +13,8 @@
 #
 # The cycle:
 #
-#   1. fetch every subscription in $REFRESH_SUBS, as $REFRESH_FETCH_USER
+#   1. set the old pool files aside, then fetch every subscription in
+#      $REFRESH_SUBS, as $REFRESH_FETCH_USER
 #   2. xray -test, then restart xray and xray-nftables
 #   3. prune whatever the observatory reports failing, restart, and repeat
 #      until nothing has failed for $REFRESH_QUIET
@@ -51,9 +52,14 @@
 #   so the exemption is CHECKED against the live ruleset and said out loud when
 #   it is not there.
 #
-# ⚠ There is no prune before the refresh. `pool` rewrites that pool's files
-#   wholesale a second later, so anything it deleted comes straight back. The
-#   settle loop is the quality gate, and it covers pools no longer listed too.
+# ⚠ Every cycle starts from an EMPTY pool: the existing 50-pool-*.json are set
+#   aside before the first fetch, so a cycle keeps only what it fetched itself.
+#   `pool` rewrites the pool it is named for and nothing else, so a subscription
+#   dropped from $SUBS, renamed, or simply not answering would otherwise leave
+#   its nodes on disk for ever, re-probed every interval with no source left to
+#   confirm them. Set ASIDE rather than deleted, because an empty confdir does
+#   not load: if not one subscription answers, the previous pool is put back and
+#   the cycle carries on pruning and publishing that instead.
 set -euo pipefail
 
 # --help prints the header block above rather than a second copy of it, so the
@@ -149,7 +155,17 @@ restart_stack() {
 
 fetch_pools() {
   [[ -r "$SUBS" ]] || { say "no subscription list at $SUBS"; return 1; }
-  local name url tmp n=0 ok=0
+  local name url tmp n=0 ok=0 saved="$WORK/prev"
+  # ⚠ The cycle starts from an empty pool. `pool` only ever rewrites the pool
+  # it was named for, so without this a subscription dropped from $SUBS,
+  # renamed, or one that stops answering leaves its nodes on disk permanently -
+  # probed every interval, with nothing upstream left to vouch for them.
+  #
+  # Set ASIDE, not deleted. A confdir whose balancer selects tags that no
+  # longer exist does not load, so if not one subscription answers, restoring
+  # this is what stops the box being one restart away from having no config.
+  mkdir -p "$saved"
+  mv "$CONFDIR"/50-pool-*.json "$saved"/ 2>/dev/null || true
   while read -r name url _; do
     [[ -n "${name:-}" && "${name:0:1}" != "#" ]] || continue
     if [[ -z "${url:-}" ]]; then
@@ -161,23 +177,29 @@ fetch_pools() {
     # parser, and </dev/null so curl cannot eat the loop's input. The redirect
     # is opened by this shell, which is root, so curl needs no access to $WORK.
     if ! fetch_one "$url" "$tmp" </dev/null; then
-      say "  $name: fetch failed - keeping the pool already on disk"; continue
+      say "  $name: fetch failed - its nodes are dropped for this cycle"; continue
     fi
-    [[ -s "$tmp" ]] || { say "  $name: empty response - keeping the pool already on disk"; continue; }
-    # A subscription that parses to nothing exits non-zero BEFORE write_pool,
-    # so the pool on disk survives a bad fetch rather than being emptied by it.
+    [[ -s "$tmp" ]] || { say "  $name: empty response - its nodes are dropped for this cycle"; continue; }
     if "$DIR/sub2xray.py" --outdir "$CONFDIR" pool \
          --name "$name" --limit "$LIMIT" --size "$SIZE" "$tmp"; then
       ok=$((ok + 1))
     else
-      say "  $name: no usable nodes - keeping the pool already on disk"
+      say "  $name: no usable nodes - its nodes are dropped for this cycle"
     fi
   done < "$SUBS"
+  if (( ok == 0 )); then
+    # Not fatal, and never left empty: yesterday's pool is still worth pruning
+    # and publishing, and a whole-list failure is nearly always the uplink
+    # rather than every subscription host dying at once. This covers an empty
+    # $SUBS too - the `return 1` below must not be reached with the pool
+    # sitting in a temp directory that is about to be deleted.
+    if (( n > 0 )); then
+      say "WARNING: every subscription failed - putting the previous pool back"
+    fi
+    mv "$saved"/*.json "$CONFDIR"/ 2>/dev/null || true
+  fi
   say "refreshed $ok of $n subscription(s), pool is now $(pool_size) node(s)"
   (( n > 0 )) || { say "$SUBS lists no subscriptions"; return 1; }
-  # Not fatal: the pools already on disk are still worth pruning and publishing,
-  # and nodes die between runs whether or not the subscription answered.
-  (( ok > 0 )) || say "WARNING: every subscription failed - pruning what is already there"
 }
 
 settle() {
@@ -289,6 +311,7 @@ EOF
 # and every later check is quiet - which is what lets the loop settle.
 stub curl <<'EOF'
 echo "curl${INSIDE_RUNUSER:+ (direct)}" >> "$CALLS"
+if [[ -n "${CURL_ALL_FAILS:-}" ]]; then exit 7; fi
 if [[ -n "${CURL_DIRECT_FAILS:-}" && -n "${INSIDE_RUNUSER:-}" ]]; then exit 7; fi
 cat <<'URIS'
 vless://u1@a.example:443?security=tls&sni=a.example#one
@@ -336,6 +359,31 @@ ok "the survivors are published 0600, and the pruned node is not among them"
 [[ $(grep -c 'systemctl restart xray.service' "$CALLS") -ge 2 ]] \
   || die "the prune was not followed by its own restart: $(cat "$CALLS")"
 ok "every prune is followed by a restart, or the journal keeps reporting it"
+
+# ⚠ A pool nobody fetches any more must not survive the cycle. `pool` rewrites
+# only the pool it is named for, so a subscription dropped from $SUBS - or one
+# that simply stops answering - would otherwise leave its nodes on disk for
+# ever, probed every interval with no source left to vouch for them.
+cat > "$work/conf/50-pool-gone-01.json" <<'EOF'
+{"outbounds": [{"tag": "prox-gone-1", "protocol": "vless", "settings": {"vnext":
+ [{"address": "stale.example", "port": 443, "users": [{"id":
+ "00000000-0000-0000-0000-000000000000", "encryption": "none"}]}]}}]}
+EOF
+out=$(run) || die "a cycle with a stale pool file exited non-zero: $out"
+[[ ! -e "$work/conf/50-pool-gone-01.json" ]]   || die "the pool of a subscription no longer listed survived the cycle"
+grep -q 'stale.example' "$work/out/working.txt"   && die "a node from a pool nobody fetches any more was published"
+ok "a pool no subscription fetches any more is gone by the end of the cycle"
+
+# ...but clearing it first must never be able to leave an EMPTY confdir. A
+# balancer selecting tags that no longer exist does not load, so a box that
+# lost its uplink for one cycle would be one restart away from no config at all.
+: > "$CALLS"
+out=$(CURL_ALL_FAILS=1 run) || die "a total fetch failure should still publish: $out"
+grep -q 'refreshed 0 of 1' <<<"$out" || die "the failure was not reported: $out"
+grep -q 'putting the previous pool back' <<<"$out" || die "it did not restore: $out"
+compgen -G "$work/conf/50-pool-test-*.json" >/dev/null   || die "every subscription failed and the pool was left empty"
+grep -q 'a.example' "$work/out/working.txt" || die "the restored pool was not published"
+ok "a cycle where nothing answers puts the previous pool back rather than emptying it"
 
 # A host that is blocked on the direct path but reachable through the pool: the
 # retry is the thing stopping the services could never have offered.
