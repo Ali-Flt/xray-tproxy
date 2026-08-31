@@ -153,6 +153,26 @@ def b64d(s):
     return base64.b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", "replace")
 
 
+# ⚠ XHTTP is refused by default because it SEGFAULTS xray at dispatch.
+#
+# Observed on 26.3.27 (d2758a0): a nil pointer dereference inside
+# splithttp.(*Config).FillStreamRequest, reached from a vless outbound through
+# splithttp.Dial -> OpenStream. Not a load-time failure, so `xray -test` passes
+# and the process dies later on whichever connection happens to pick that node,
+# taking the whole proxy with it - and under Restart=on-failure, looping. One
+# confdir logged 122 restarts.
+#
+# Refused rather than guarded because the trigger is NOT characterised: the URL
+# in the crashing frame was an ordinary 29-character https://host:port/, so it
+# is not simply a malformed path. Until it is understood no subset of xhttp
+# nodes can be called safe, and this repo's rule for a node that can panic xray
+# is the one already applied to hysteria v1: refuse it here, because nothing
+# downstream gets another chance.
+#
+# It costs about 3% of a subscription. `pool --xhttp` puts it back.
+ALLOW_XHTTP = False
+
+
 def url_path(path):
     """A path xray can build a request URL from, or a refusal.
 
@@ -186,6 +206,9 @@ def stream(net, security, sni, host, path, service, fp, pbk, sid):
     elif net == "grpc":
         ss["grpcSettings"] = {"serviceName": service}
     elif net == "xhttp":
+        if not ALLOW_XHTTP:
+            raise ValueError("xhttp/splithttp segfaults xray at dispatch "
+                             "(26.3.27); --xhttp to include it anyway")
         # XHTTP (formerly HTTP transport): needs a path, defaults to /.
         # host is optional — if absent, serverName is used.
         ss["xhttpSettings"] = {
@@ -1234,8 +1257,10 @@ def _selftest():
     buf, old = io.StringIO(), sys.stderr
     sys.stderr = buf
     try:
-        kept = build("vless://u@a.com:443?type=xhttp&path=%2Fa%25zz#bad\n"
-                     "vless://u@b.com:443?type=xhttp&path=%2Fok#good", "p")["outbounds"]
+        # ws, not xhttp: xhttp is refused outright now, and this is testing
+        # the path check rather than that refusal.
+        kept = build("vless://u@a.com:443?type=ws&path=%2Fa%25zz#bad\n"
+                     "vless://u@b.com:443?type=ws&path=%2Fok#good", "p")["outbounds"]
     finally:
         sys.stderr = old
     assert [o["settings"]["vnext"][0]["address"] for o in kept] == ["b.com"], kept
@@ -1257,9 +1282,22 @@ def _selftest():
 
     # splithttp is xhttp's old name. Left alone it matched no branch in
     # stream() and the node went out with no transport settings at all.
-    sp = parse("vless://u@a.com:443?type=splithttp&path=%2Fp&host=h.com", "t")
-    assert sp["streamSettings"]["network"] == "xhttp", sp["streamSettings"]
-    assert sp["streamSettings"]["xhttpSettings"]["path"] == "/p"
+    # ⚠ xhttp segfaults xray at dispatch, so it is refused unless asked for -
+    # under every one of its names, since they are all the same transport.
+    for uri in ("vless://u@a.com:443?type=xhttp&path=%2Fp",
+                "vless://u@a.com:443?type=splithttp&path=%2Fp",
+                "vless://u@a.com:443?type=http&path=%2Fp"):
+        try:
+            parse(uri, "t"); assert False, f"{uri} should have been refused"
+        except ValueError as e:
+            assert "segfaults xray" in str(e), e
+    globals()["ALLOW_XHTTP"] = True
+    try:
+        sp = parse("vless://u@a.com:443?type=splithttp&path=%2Fp&host=h.com", "t")
+        assert sp["streamSettings"]["network"] == "xhttp", sp["streamSettings"]
+        assert sp["streamSettings"]["xhttpSettings"]["path"] == "/p"
+    finally:
+        globals()["ALLOW_XHTTP"] = False
 
     # ---- dedupe keys on the CONFIGURATION, not the server ---------------
     # Same host, same credential, different transport. node_id cannot tell
@@ -1675,6 +1713,11 @@ if __name__ == "__main__":
     p_pool = sub.add_parser("pool", help="write node files for one subscription")
     p_pool.add_argument("source", nargs="?", help="subscription file; omit for stdin")
     p_pool.add_argument("--name", default="main", help="pool name, namespaces the tags")
+    p_pool.add_argument("--xhttp", action="store_true",
+                        help="include xhttp/splithttp nodes. Off by default: "
+                             "they segfault xray 26.3.27 at DISPATCH, which "
+                             "xray -test cannot catch and which takes the whole "
+                             "proxy down on whichever connection picks one.")
     p_pool.add_argument("--size", type=int, default=0, metavar="N",
                         help="nodes per file; 0 (default) puts them all in one")
     p_pool.add_argument("--limit", type=int, default=0, metavar="N",
@@ -1745,6 +1788,7 @@ if __name__ == "__main__":
         if not os.path.exists(os.path.join(args.outdir, ROUTING)):
             sys.exit(f"{args.outdir}/{ROUTING} missing - run: sub2xray.py "
                      f"--outdir {args.outdir} init")
+        ALLOW_XHTTP = args.xhttp
         src = open(args.source).read() if args.source else sys.stdin.read()
         outbounds = build(src, args.name)["outbounds"]
         # Named, not silent. Dropping most of a subscription without a word is

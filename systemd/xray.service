@@ -1,4 +1,13 @@
 [Unit]
+# ⚠ StartLimit* live HERE, not in [Service] - systemd ignores them there with
+# only a log line. Without a limit xray cannot give up: the default is 5 starts
+# in 10 seconds and at RestartSec=5s only two fit that window, so a config that
+# crashes the process on every connection loops for ever. One box logged 122
+# restarts. Five failures in two minutes now stops it, and a stopped xray takes
+# the capture down with it (PartOf), leaving plain unproxied internet rather
+# than a proxy that flaps every five seconds.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 Description=Xray Service
 Documentation=https://xtls.github.io/
 After=network.target nss-lookup.target
