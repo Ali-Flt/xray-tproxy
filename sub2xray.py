@@ -85,6 +85,9 @@ SOCKOPT = {"mark": FWMARK}
 
 
 TAG_PREFIX = "prox"      # the selector in ROUTING; kept in step below
+# How many skipped nodes get NAMED per scheme; the rest are only counted.
+# See build() for why this is not "all of them".
+SKIP_NAMES = 5
 
 # One confdir, shared with wg-peer.sh via the same env var and the same default.
 # If these two ever disagree you get a config that looks fine and routes nothing,
@@ -162,14 +165,41 @@ def url_path(path):
 
     Go's url.Parse rejects exactly two things, so those are what this checks:
     ASCII control bytes, and a % that is not followed by two hex digits.
+
+    A missing leading slash is NOT one of them - `path=xyz` and `path=?ed=2048`
+    are ordinary in these subscriptions (a leading / is easy to lose when a
+    panel builds the URI by hand), every client normalises them, and refusing
+    them threw away 153 otherwise-valid nodes across the sources here. So it
+    is repaired rather than refused.
     """
     if not path.startswith("/"):
-        raise ValueError(f"path {path!r} does not start with /")
+        path = "/" + path
     if any(ord(c) < 0x20 or ord(c) == 0x7f for c in path):
         raise ValueError(f"path {path!r} has a control character")
     if re.search(r"%(?![0-9A-Fa-f]{2})", path):
         raise ValueError(f"path {path!r} has an invalid percent-escape")
     return path
+
+
+def security_type(value, proto):
+    """The transport security xray will accept, or a refusal.
+
+    ⚠ This is the one field where a bad value costs more than the node. An
+    unknown `network` breaks only its own outbound, but an unknown security
+    makes xray refuse THE WHOLE CONFDIR - `Unknown security "false"` - so one
+    subscription line spelling security=false takes down every pool file at
+    once, and the refresh cycle with it, and leaves the running service on
+    whatever it loaded last. A named skip is the cheap outcome, so anything
+    not on this list is refused here rather than passed through and trusted.
+    """
+    v = (value or "").strip().lower()
+    if v in ("", "none", "false", "0"):
+        return "none"
+    if v == "xtls":            # legacy XTLS, removed in Xray 5.x
+        return "tls"
+    if v in ("tls", "reality"):
+        return v
+    raise ValueError(f"{proto} unknown security: {value!r}")
 
 
 def stream(net, security, sni, host, path, service, fp, pbk, sid):
@@ -217,10 +247,7 @@ def parse_vless(uri, tag):
         net = "xhttp"
     if net not in ("tcp", "ws", "grpc", "xhttp", "kcp", "quic", "h2", "raw", "httpupgrade", "splithttp"):
         raise ValueError(f"vless unknown transport: {net!r}")
-    # Legacy XTLS removed in Xray 5.x: security=xtls -> security=tls
-    security = q.get("security", "none")
-    if security == "xtls":
-        security = "tls"
+    security = security_type(q.get("security", "none"), "vless")
     # REALITY requires a public key; without it the node is broken
     if security == "reality" and not q.get("pbk"):
         raise ValueError("reality without public key (pbk)")
@@ -265,11 +292,8 @@ def parse_trojan(uri, tag):
         net = "xhttp"
     if net not in ("tcp", "ws", "grpc", "xhttp", "kcp", "quic", "h2", "raw", "httpupgrade", "splithttp"):
         raise ValueError(f"trojan unknown transport: {net!r}")
-    # Legacy XTLS removed in Xray 5.x: security=xtls -> security=tls
-    # (XTLS is now xtls-rprx-vision flow with TLS, not a separate security mode)
-    security = q.get("security", "tls")
-    if security == "xtls":
-        security = "tls"
+    # trojan is TLS unless it says otherwise, which is the opposite of vless.
+    security = security_type(q.get("security", "tls"), "trojan")
     # REALITY requires a public key; without it the node is broken
     if security == "reality" and not q.get("pbk"):
         raise ValueError("reality without public key (pbk)")
@@ -600,8 +624,19 @@ def build(raw, pool):
     # a pool that lost members without saying so.
     for scheme, why in sorted(skipped.items()):
         print(f"skipped {len(why)} {scheme} node(s):", file=sys.stderr)
-        for w in why:
+        # Counted in full, named up to a limit. Naming every one was the
+        # original rule and it does not survive contact with these lists: one
+        # aggregator alone skips ~900 ss lines that are really mislabelled
+        # vmess blobs, and printing each meant ~900 lines of decoded binary in
+        # the journal every refresh, burying the four lines that say what the
+        # cycle actually did. The COUNT is what tells you a subscription
+        # halved; the names are only there to tell you why, and a handful of
+        # examples does that as well as a thousand.
+        for w in why[:SKIP_NAMES]:
             print(f"  {w}", file=sys.stderr)
+        if len(why) > SKIP_NAMES:
+            print(f"  ...and {len(why) - SKIP_NAMES} more, not listed",
+                  file=sys.stderr)
     if dupes:
         # Counted, not named, and that is not the inconsistency it looks like:
         # a skip is a node you asked for and cannot have, which is worth a name
@@ -1271,10 +1306,40 @@ def _selftest():
         url_path("/a\tb"); assert False, "a control character should be refused"
     except ValueError as e:
         assert "control character" in str(e), e
+    # A missing leading slash is repaired, not refused: every client does this
+    # and refusing it threw away otherwise-valid nodes by the hundred.
+    assert url_path("noslash") == "/noslash"
+    assert url_path("?ed=2048") == "/?ed=2048"
+    assert url_path("/keep") == "/keep"
+
+    # ⚠ security is whitelisted, because an unknown value there is not one bad
+    # node - xray refuses the entire confdir over it, so every pool goes down
+    # together. `security=false` is the one that actually turned up in a
+    # subscription and took the whole config with it.
+    assert security_type("false", "vless") == "none"
+    assert security_type("", "vless") == "none"
+    assert security_type("none", "vless") == "none"
+    assert security_type("xtls", "vless") == "tls"      # removed in Xray 5.x
+    assert security_type("TLS", "vless") == "tls"
+    assert security_type("reality", "vless") == "reality"
+    for bad in ("wireguard", "tls13", "yes"):
+        try:
+            security_type(bad, "vless"); assert False, f"{bad} should be refused"
+        except ValueError as e:
+            assert "unknown security" in str(e), e
+    # ...and it is refused at the parser, so the node is skipped and named
+    # rather than reaching a config file that will not load.
     try:
-        url_path("noslash"); assert False, "a relative path should be refused"
-    except ValueError:
-        pass
+        parse("vless://u@a.com:443?security=false&type=tcp", "t")
+    except ValueError as e:
+        assert False, f"security=false must normalise, not raise: {e}"
+    assert parse("vless://u@a.com:443?security=false", "t") \
+        ["streamSettings"]["security"] == "none"
+    try:
+        parse("vless://u@a.com:443?security=wireguard", "t")
+        assert False, "an unknown security should be refused"
+    except ValueError as e:
+        assert "unknown security" in str(e), e
     # ...and the refusal reaches build(), which names it rather than emitting it
     buf, old = io.StringIO(), sys.stderr
     sys.stderr = buf
@@ -1294,13 +1359,11 @@ def _selftest():
     once = parse("vless://u@a.com:443?type=ws&path=%2Fa%2520b", "t")
     assert once["streamSettings"]["wsSettings"]["path"] == "/a%20b", \
         "the path was decoded twice; %2520 became a literal space"
-    # ...and a path that decodes to something that is not a path at all is
-    # refused rather than handed over as a relative URL.
-    try:
-        parse("vless://u@a.com:443?type=ws&path=%252Fa", "t")
-        assert False, "should have been refused"
-    except ValueError as e:
-        assert "does not start with /" in str(e), e
+    # ...and one that decodes to something without a leading slash gets the
+    # slash put back, with its escape left exactly as it arrived - repairing
+    # the shape must not turn into decoding it a second time.
+    twice = parse("vless://u@a.com:443?type=ws&path=%252Fa", "t")
+    assert twice["streamSettings"]["wsSettings"]["path"] == "/%2Fa", twice
 
     # splithttp is xhttp's old name. Left alone it matched no branch in
     # stream() and the node went out with no transport settings at all.
@@ -1388,6 +1451,24 @@ def _selftest():
         sys.stderr = old
     noise = buf.getvalue()
     assert "skipped 1 hysteria node(s)" in noise, noise
+    # ...and a scheme with more failures than SKIP_NAMES is counted in full
+    # but named only up to the cap, or one aggregator's ~900 mislabelled lines
+    # bury everything the cycle actually did.
+    many = "\n".join(f"ss://{'z' * 20}@h{i}.example:443" for i in range(40))
+    buf2, old2 = io.StringIO(), sys.stderr
+    sys.stderr = buf2
+    try:
+        try:
+            build(many, "de")
+        except SystemExit:
+            pass
+    finally:
+        sys.stderr = old2
+    n2 = buf2.getvalue()
+    assert "skipped 40 ss node(s)" in n2, n2          # the count is exact
+    assert n2.count("h0.example") == 1, n2            # ...the first few named
+    assert "...and 35 more, not listed" in n2, n2     # ...and the rest are not
+    assert n2.count("example:443") == SKIP_NAMES, n2
     assert "f.com:443" in noise, noise          # named, not just counted
     assert "only speaks version 2" in noise, noise
 
