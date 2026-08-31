@@ -224,7 +224,13 @@ async def send(client, peer, cfg, fresh, total):
         # markdown would eat half of them and mangle the rest; inside a fence
         # nothing is parsed, and Telegram renders it monospace with a copy
         # button, which is the whole point of sending text rather than a file.
-        text = "**{}**\n```\n{}\n```".format(head, "\n".join(part))
+        # ⚠ No newline beside either fence. telethon's markdown is a plain
+        # delimiter parser - it removes the ``` characters and NOTHING else,
+        # so the text between them becomes the code block verbatim. A newline
+        # there is not formatting, it is a blank first line inside the block.
+        # (The ```lang form belongs to Telegram's server-side MarkdownV2,
+        # which is not what parse_mode="md" reaches.)
+        text = "**{}**\n```{}```".format(head, "\n".join(part))
         # link_preview off, or a message of URLs grows a preview card for
         # whichever one Telegram decides to resolve.
         await asyncio.wait_for(
@@ -494,6 +500,13 @@ def _selftest():
     asyncio.run(send(ok, None, cfg, ["vless://" + "x" * 2000] * 2, 2))
     assert len(ok.sent) == 2, ok.sent            # both chunks, neither dropped
     assert "(1/2)" in ok.sent[0] and "(2/2)" in ok.sent[1], ok.sent
+    # ⚠ Whatever sits between the fences IS the code block, character for
+    # character - telethon strips the ``` and nothing else. A newline next to
+    # a fence is a blank line in the message, not formatting.
+    fenced = ok.sent[0].split("```")
+    assert len(fenced) == 3, ok.sent[0][:120]
+    assert fenced[1] == "vless://" + "x" * 2000, \
+        "the fenced block is padded; a newline by a fence is a blank line"
 
     # ⚠ The reconnect churn comes from telethon's own logger, not this one, so
     # turning down the root would have silenced the bot's sends along with it.
