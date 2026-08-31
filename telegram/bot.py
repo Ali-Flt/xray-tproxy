@@ -24,6 +24,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from datetime import datetime, timezone
 
 CONFIG = os.environ.get("TGPUSH_CONFIG", "/etc/tgpush/config.ini")
@@ -34,6 +35,20 @@ log = logging.getLogger("tgpush")
 # How long a health probe waits for Telegram before the pool is called
 # unreachable. Short: it is a round trip to a datacentre, not a download.
 HEALTH_TIMEOUT = 10
+
+# How long one message may take before the tick gives up on it.
+#
+# ⚠ Telethon retries internally on a bad connection - reconnects, re-sends,
+# several times over - and none of that is bounded by anything here. On a pool
+# that cannot hold a connection a single send_message() can block for MINUTES,
+# and while it does the tick loop is stopped dead: nothing is read, nothing is
+# logged, and the bot looks frozen rather than failing. A bounded send turns
+# that silence into "tick failed, retrying", which is a thing you can see.
+#
+# A send that times out may still have landed, so the retry can duplicate a
+# message. That is the right way round: state is recorded only after a send
+# returns, so the alternative to a duplicate is a node that is never announced.
+SEND_TIMEOUT = 60
 
 
 def setup_logging():
@@ -205,7 +220,9 @@ async def send(client, peer, cfg, fresh, total):
         text = "**{}**\n```\n{}\n```".format(head, "\n".join(part))
         # link_preview off, or a message of URLs grows a preview card for
         # whichever one Telegram decides to resolve.
-        await client.send_message(peer, text, parse_mode="md", link_preview=False)
+        await asyncio.wait_for(
+            client.send_message(peer, text, parse_mode="md", link_preview=False),
+            SEND_TIMEOUT)
         if i < len(parts):
             await asyncio.sleep(1)   # polite, and well inside the flood limits
 
@@ -417,6 +434,42 @@ def _selftest():
     assert newcomers(both, keys_before) == [other]
     assert newcomers({}, keys_before) == []
     assert set(both) != keys_before
+
+    # ⚠ A send must not be able to block the tick loop for ever. Telethon
+    # retries internally on a bad connection and none of it is bounded, so an
+    # unbounded send_message() on a pool that cannot hold a connection stops
+    # the loop dead - nothing read, nothing logged, a bot that looks frozen
+    # rather than one that is failing. Pinned with a client that never answers
+    # and a budget shrunk to keep the test quick.
+    class Deaf:
+        async def send_message(self, *a, **k):
+            await asyncio.sleep(3600)
+
+    cfg = {"caption": "{n} new - {total} working - {when}"}
+    budget, globals()["SEND_TIMEOUT"] = SEND_TIMEOUT, 0.2
+    try:
+        started = time.monotonic()
+        try:
+            asyncio.run(send(Deaf(), None, cfg, ["vless://u@a.com:443#x"], 1))
+            assert False, "a send that never answers must not return"
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+        assert time.monotonic() - started < 5, "send() did not bound itself"
+    finally:
+        globals()["SEND_TIMEOUT"] = budget
+
+    # ...and a client that does answer still gets every chunk, in order.
+    class Heard:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, peer, text, **k):
+            self.sent.append(text)
+
+    ok = Heard()
+    asyncio.run(send(ok, None, cfg, ["vless://" + "x" * 2000] * 2, 2))
+    assert len(ok.sent) == 2, ok.sent            # both chunks, neither dropped
+    assert "(1/2)" in ok.sent[0] and "(2/2)" in ok.sent[1], ok.sent
 
     # ⚠ The reconnect churn comes from telethon's own logger, not this one, so
     # turning down the root would have silenced the bot's sends along with it.
