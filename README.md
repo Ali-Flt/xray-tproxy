@@ -121,7 +121,7 @@ That leaves port 22 alone. In `selective` mode it still goes direct, because ssh
 
 **An empty pool is a silent total outage.** `fallbackTag` is `block`, so when the balancer can pick nobody, traffic is blackholed rather than leaking. `ALIVE_MIN` (default 1) refuses a prune that would leave fewer than N.
 
-**Probe cost is the whole pool, every interval, concurrently, with no backoff.** Past ~200 outbounds the balancer stops converging and looks like it is full of bad nodes. `sub2xray.py` prints the arithmetic when you cross it; cut it with `REFRESH_LIMIT`, `alive.sh --prune`, or a longer `--probe-interval`.
+**Probe cost is the whole pool, every interval, concurrently, with no backoff.** Past ~200 outbounds the balancer stops converging and looks like it is full of bad nodes. `sub2xray.py` prints the arithmetic when you cross it; cut it with `REFRESH_LIMIT`, `alive.sh --prune`, or a longer `--probe-interval`. `REFRESH_LIMIT` takes a **random** sample of each subscription, not the first N, so a small limit across many subscriptions rotates over the whole corpus instead of re-probing one fixed head. `subscriptions.txt.example` lists more sources, with the overlap between them measured.
 
 **`pool` and `export` drop repeated entries**, keyed on the whole outbound bar its tag - so one server offered over two transports stays two entries. Both say how many collapsed, which is why a settled pool of 13 can publish 5.
 

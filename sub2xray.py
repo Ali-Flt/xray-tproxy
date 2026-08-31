@@ -29,6 +29,7 @@ import io
 import glob
 import json
 import os
+import random
 import re
 import sys
 import uuid
@@ -611,6 +612,30 @@ def build(raw, pool):
     if not outbounds:
         sys.exit("no vless/vmess/trojan/ss nodes found in input")
     return {"outbounds": outbounds}
+
+
+def pick(outbounds, limit):
+    """A random `limit` of them, renumbered. limit <= 0, or too big, keeps all.
+
+    Random rather than the first N. A subscription's order is upstream's own,
+    not a ranking, so the head is not the good part - and taking the head means
+    the SAME head every refresh, with the tail never probed even once. A pool
+    of 5000 behind --limit 150 would be a pool of 150 that merely looks like it
+    is being refreshed. Sampling afresh each cycle makes --limit a window that
+    moves, so a working node at line 4000 eventually gets its turn, and a node
+    that stops working is not kept forever just for being near the top.
+
+    Renumbered because a tag's number is positional: leaving the picks as
+    -7, -412, -3901 would read in the journal like most of the pool went
+    missing, which is the one thing every count in this file exists to
+    distinguish from a subscription that actually shrank.
+    """
+    if not 0 < limit < len(outbounds):
+        return outbounds
+    kept = random.sample(outbounds, limit)
+    for i, ob in enumerate(kept, 1):
+        ob["tag"] = f"{ob['tag'].rsplit('-', 1)[0]}-{i}"
+    return kept
 
 
 def node_id(ob):
@@ -1376,6 +1401,24 @@ def _selftest():
     # two pools must never collide: -confdir silently overwrites a duplicate tag
     assert not ({o["tag"] for o in a["outbounds"]} & {o["tag"] for o in b["outbounds"]})
 
+    # --limit samples, it does not truncate. Seeded, so this is deterministic:
+    # the point being pinned is that repeated calls DIFFER, because a --limit
+    # that always returned the head would silently reduce a 5000-node
+    # subscription to the same 150 nodes forever.
+    random.seed(4)
+    full = [{"tag": f"prox-p-{i}", "n": i} for i in range(1, 21)]
+    seen = {tuple(o["n"] for o in pick([dict(o) for o in full], 5))
+            for _ in range(50)}
+    assert len(seen) > 1, "pick() returned the same nodes every time"
+    assert all(len(p_) == 5 and set(p_) <= set(range(1, 21)) for p_ in seen), seen
+    # ...and the tags it hands back are 1..N with no gaps, whatever it picked
+    assert [o["tag"] for o in pick([dict(o) for o in full], 5)] == \
+        [f"prox-p-{i}" for i in range(1, 6)]
+    # a limit of 0, or one bigger than the pool, is "keep all" and must not
+    # reorder or renumber anything
+    assert pick([dict(o) for o in full], 0) == full
+    assert pick([dict(o) for o in full], 999) == full
+
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         nodes = [{"tag": f"prox-x-{i}"} for i in range(1, 8)]
@@ -1702,9 +1745,12 @@ if __name__ == "__main__":
                         help="nodes per file; 0 (default) puts them all in one")
     p_pool.add_argument("--limit", type=int, default=0, metavar="N",
                         help="keep at most N nodes from this subscription "
-                             "(0 = all). The observatory probes every node it "
-                             "is given, concurrently, every interval, so this "
-                             "is the lever that bounds that cost at the source.")
+                             "(0 = all), chosen at RANDOM, so re-running walks "
+                             "a different slice each time rather than pinning "
+                             "the same head forever. The observatory probes "
+                             "every node it is given, concurrently, every "
+                             "interval, so this is the lever that bounds that "
+                             "cost at the source.")
 
     p_exp = sub.add_parser("export",
                            help="print the pool's nodes back as URIs, on stdout")
@@ -1774,8 +1820,9 @@ if __name__ == "__main__":
         # the same failure as a subscription that silently halves.
         if 0 < args.limit < len(outbounds):
             print(f"--limit: keeping {args.limit} of {len(outbounds)} nodes in "
-                  f"pool '{args.name}'; the rest are not written", file=sys.stderr)
-            outbounds = outbounds[:args.limit]
+                  f"pool '{args.name}', picked at random; the rest are not "
+                  f"written this cycle", file=sys.stderr)
+        outbounds = pick(outbounds, args.limit)
         n = write_pool(args.outdir, args.name, outbounds, args.size)
         print(f"{len(outbounds)} nodes in pool '{args.name}' across {n} file(s)",
               file=sys.stderr)

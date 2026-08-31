@@ -114,14 +114,19 @@ check_exempt() {
 }
 
 fetch_one() {   # <url> <dest>
+  # -L because several subscription hosts answer on a redirect (a missing
+  # trailing slash is enough). Without it curl writes the empty 301 body and
+  # exits 0 - -f only fails on 4xx and 5xx - so the pool would be "fetched",
+  # empty, and blamed on the subscription having died.
+  #
   # Direct first, as the exempt user, so the pool being replaced cannot break
   # the fetch that replaces it.
-  runuser -u "$FETCH_USER" -- curl -fsS --max-time "$CURL_TIMEOUT" "$1" >"$2" && return 0
+  runuser -u "$FETCH_USER" -- curl -fLsS --max-time "$CURL_TIMEOUT" "$1" >"$2" && return 0
   # ...and captured second, which the stop-the-services version of this could
   # never offer: a subscription host that is blocked on the direct path but
   # reachable through the pool is fetched through the pool.
   say "    direct fetch failed - retrying through the proxy"
-  curl -fsS --max-time "$CURL_TIMEOUT" "$1" >"$2"
+  curl -fLsS --max-time "$CURL_TIMEOUT" "$1" >"$2"
 }
 
 restart_stack() {

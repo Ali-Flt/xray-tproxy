@@ -18,3 +18,34 @@
 # nodes. sub2xray prints the arithmetic when the total passes 200.
 
 radikal_secure  https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/secure/configs.txt
+
+# More sources, all verified to parse as plain URI lists (shadowmere is base64;
+# the .html ones are plain text despite the extension). Uncomment what you want.
+#
+# ⚠ Together these are >13000 distinct nodes, and the observatory probes the
+#   TOTAL every interval. Do NOT enable several at REFRESH_LIMIT=150. Since
+#   --limit now samples at RANDOM rather than taking the head, a SMALL limit
+#   across MANY subscriptions is strictly better than a large one across few:
+#   every cycle walks a different slice, so the whole corpus gets covered over
+#   an afternoon instead of the same 150 nodes being re-probed forever.
+#   Nine subscriptions at REFRESH_LIMIT=25 is ~225 nodes per cycle, which is
+#   about the budget one host converges on.
+
+# The two large aggregators. Between them they carry most of what the others
+# have, plus several thousand nodes nobody else mirrors.
+#solispirit      https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/all_configs.txt
+#avencores26     https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/main/githubmirror/26.txt
+#avencores12     https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/main/githubmirror/12.txt
+
+# Small, and each carries a few dozen nodes the aggregators do not.
+# shadowmere is worth its slot despite the size: it is all shadowsocks, so it
+# fails differently from the vless-heavy lists above.
+#openproxylist   https://raw.githubusercontent.com/roosterkid/openproxylist/refs/heads/main/V2RAY_RAW.txt
+#arshiacomplus   https://raw.githubusercontent.com/arshiacomplus/v2rayExtractor/main/mix/sub.html
+#shadowmere      https://shadowmere.xyz/api/b64sub/
+#hidashimora     https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/1.1.txt
+
+# Measured as near-total duplicates of the lists above - they cost probe budget
+# and add nothing. Kept here only so the next person does not re-test them:
+#   Epodonios/v2ray-configs   All_Configs_Sub.txt   3702 nodes, 103 not in solispirit
+#   youfoundamin/V2rayCollector  mixed_iran.txt      373 nodes, 0 not already covered
