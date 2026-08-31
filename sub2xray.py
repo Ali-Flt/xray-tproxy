@@ -444,15 +444,22 @@ def parse_hysteria2(uri, tag):
         "protocol": "hysteria",
         "settings": {"version": 2, "address": host, "port": port,
                      "password": unquote(u.username or "")},
-        # Same reason as shadowsocks: no streamSettings meant no fwmark.
-        # streamSettings is parsed by the generic StreamConfig for every
-        # protocol before the transport ever sees it, so naming sockopt here
-        # cannot fail to load whatever hysteria does with it afterwards.
+        # ⚠ network MUST be "hysteria", not the default. Newer builds assert
+        # it: proxy/hysteria/client.go does
+        #     if _, ok := streamSettings.ProtocolSettings.(*hysteria.Config); !ok {
+        #         return nil, errors.New("not hysteria transport")
+        # and a config that omits it fails to LOAD with exactly that message.
+        # 26.3.27's client.go has no such assertion, which is why sockopt alone
+        # worked there; it does map the same network name, so this loads on
+        # both and a rollback is safe.
+        #
+        # sockopt for the same reason as shadowsocks: no streamSettings at all
+        # meant no fwmark, and every dial was recaptured by the tproxy inbound.
         # ⚠ Whether its QUIC dialer HONOURS the mark is not something this repo
         # verifies - it opens its own socket. That is why nftables also skips
         # xray's uid: the mark is the belt, the uid rule is the braces, and for
         # a protocol like this one only the braces are load-bearing.
-        "streamSettings": {"sockopt": dict(SOCKOPT)},
+        "streamSettings": {"network": "hysteria", "sockopt": dict(SOCKOPT)},
     }
 
 
@@ -1253,6 +1260,11 @@ def _selftest():
     assert h["protocol"] == "hysteria"
     assert h["settings"] == {"version": 2, "address": "h.example", "port": 8443,
                              "password": "p@ss"}
+    # ⚠ Newer xray refuses to LOAD a hysteria outbound whose transport is not
+    # declared: "proxy/hysteria: not hysteria transport". sockopt alone is not
+    # enough, and the failure takes the whole config with it.
+    assert h["streamSettings"] == {"network": "hysteria",
+                                   "sockopt": {"mark": FWMARK}}, h["streamSettings"]
     assert "hy2://" and parse("hy2://pw@h.example:443", "t")["protocol"] == "hysteria"
     # ⚠ A hysteria outbound with no address PANICS xray on load rather than
     # failing -test, so one malformed entry would take the service down. Refuse
