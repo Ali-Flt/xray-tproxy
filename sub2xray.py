@@ -153,51 +153,11 @@ def b64d(s):
     return base64.b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", "replace")
 
 
-# ⚠ XHTTP is refused by default because it SEGFAULTS xray at dispatch.
-#
-# Observed on 26.3.27 (d2758a0): a nil pointer dereference inside
-# splithttp.(*Config).FillStreamRequest, reached from a vless outbound through
-# splithttp.Dial -> OpenStream. Not a load-time failure, so `xray -test` passes
-# and the process dies later on whichever connection happens to pick that node,
-# taking the whole proxy with it - and under Restart=on-failure, looping. One
-# confdir logged 122 restarts.
-#
-# FIXED UPSTREAM, and the mechanism is confirmed by diffing the two versions of
-# transport/internet/splithttp/client.go:
-#
-#   d2758a0   req, _ := http.NewRequestWithContext(...)   <- error DISCARDED
-#             c.transportConfig.FillStreamRequest(req, ...)
-#
-#   main      req, err := http.NewRequestWithContext(...)
-#             if err != nil { ...; return nil, nil, nil, err }
-#             c.transportConfig.FillStreamRequest(req, ...)
-#
-# So a URL Go cannot parse yields a nil *http.Request that 26.3.27 hands
-# straight to FillStreamRequest, which dereferences it on its first line.
-#
-# Refused rather than guarded because WHICH urls are unparseable is still not
-# characterised - url_path below rejects everything net/url documents as
-# invalid and a crashing node got through anyway - so on an affected build no
-# subset of xhttp nodes can be called safe. This repo's rule for a node that
-# can panic xray is hysteria v1's: refuse it here, because nothing downstream
-# gets another chance.
-#
-# It costs about 3% of a subscription. On a build newer than 26.3.27, where the
-# error is checked, `pool --xhttp` puts them back.
-ALLOW_XHTTP = False
-
-
 def url_path(path):
     """A path xray can build a request URL from, or a refusal.
 
-    ⚠ XHTTP does not validate this at load - it dereferences it at DISPATCH.
-    splithttp's OpenStream builds the request with http.NewRequestWithContext
-    and DOES NOT CHECK THE ERROR (client.go:63), so a URL Go cannot parse
-    yields a nil *http.Request that FillStreamRequest dereferences on its first
-    line. That is a SIGSEGV taking the whole process down, on some connection
-    hours after `xray -test` passed - which is why this is refused here, the
-    way hysteria's missing address is: nothing downstream gets another chance.
-    Verified against 26.3.27.
+    A path that cannot go in a URL is a node that can never connect, so it is
+    refused here and named rather than emitted and left to fail quietly later.
 
     Go's url.Parse rejects exactly two things, so those are what this checks:
     ASCII control bytes, and a % that is not followed by two hex digits.
@@ -224,9 +184,6 @@ def stream(net, security, sni, host, path, service, fp, pbk, sid):
     elif net == "grpc":
         ss["grpcSettings"] = {"serviceName": service}
     elif net == "xhttp":
-        if not ALLOW_XHTTP:
-            raise ValueError("xhttp/splithttp segfaults xray at dispatch "
-                             "(26.3.27); --xhttp to include it anyway")
         # XHTTP (formerly HTTP transport): needs a path, defaults to /.
         # host is optional — if absent, serverName is used.
         ss["xhttpSettings"] = {
@@ -254,7 +211,7 @@ def parse_vless(uri, tag):
     # splithttp is xhttp under its old name; both are the same transport, and
     # normalising here is what gets it a settings block at all - left as
     # "splithttp" it matched no branch in stream() and the node went out with
-    # no transport config, which is the other way to reach a nil dereference.
+    # no transport config whatsoever.
     if net in ("http", "splithttp"):
         net = "xhttp"
     if net not in ("tcp", "ws", "grpc", "xhttp", "kcp", "quic", "h2", "raw", "httpupgrade", "splithttp"):
@@ -302,7 +259,7 @@ def parse_trojan(uri, tag):
     # splithttp is xhttp under its old name; both are the same transport, and
     # normalising here is what gets it a settings block at all - left as
     # "splithttp" it matched no branch in stream() and the node went out with
-    # no transport config, which is the other way to reach a nil dereference.
+    # no transport config whatsoever.
     if net in ("http", "splithttp"):
         net = "xhttp"
     if net not in ("tcp", "ws", "grpc", "xhttp", "kcp", "quic", "h2", "raw", "httpupgrade", "splithttp"):
@@ -1276,10 +1233,8 @@ def _selftest():
             pass
 
     # ---- a path xray cannot put in a URL is refused, not emitted --------
-    # ⚠ splithttp's OpenStream does not check the error from
-    # http.NewRequestWithContext, so a URL Go cannot parse becomes a nil
-    # *http.Request that FillStreamRequest dereferences: SIGSEGV at DISPATCH,
-    # hours after xray -test passed. One node in the pool takes the proxy down.
+    # A path that cannot go in a URL is a node that can never connect, and
+    # nothing downstream reports it, so it is refused here and named.
     assert url_path("/api/v1") == "/api/v1"
     assert url_path("/a%2Fb") == "/a%2Fb"          # a VALID escape is fine
     for bad in ("/a%zz", "/a%2", "/a%"):           # url.Parse: invalid escape
@@ -1308,9 +1263,9 @@ def _selftest():
     assert [o["settings"]["vnext"][0]["address"] for o in kept] == ["b.com"], kept
     assert "percent-escape" in buf.getvalue(), buf.getvalue()
 
-    # ⚠ parse_qs ALREADY decodes. The second unquote decoded again, turning
-    # %2520 into a literal space and %25zz into that invalid escape - this
-    # parser was manufacturing the input that crashed xray.
+    # ⚠ parse_qs ALREADY decodes. A second unquote decoded again, turning
+    # %2520 into a literal space and %25zz into an invalid escape - the parser
+    # was corrupting paths that had arrived perfectly well formed.
     once = parse("vless://u@a.com:443?type=ws&path=%2Fa%2520b", "t")
     assert once["streamSettings"]["wsSettings"]["path"] == "/a%20b", \
         "the path was decoded twice; %2520 became a literal space"
@@ -1324,22 +1279,10 @@ def _selftest():
 
     # splithttp is xhttp's old name. Left alone it matched no branch in
     # stream() and the node went out with no transport settings at all.
-    # ⚠ xhttp segfaults xray at dispatch, so it is refused unless asked for -
-    # under every one of its names, since they are all the same transport.
-    for uri in ("vless://u@a.com:443?type=xhttp&path=%2Fp",
-                "vless://u@a.com:443?type=splithttp&path=%2Fp",
-                "vless://u@a.com:443?type=http&path=%2Fp"):
-        try:
-            parse(uri, "t"); assert False, f"{uri} should have been refused"
-        except ValueError as e:
-            assert "segfaults xray" in str(e), e
-    globals()["ALLOW_XHTTP"] = True
-    try:
-        sp = parse("vless://u@a.com:443?type=splithttp&path=%2Fp&host=h.com", "t")
-        assert sp["streamSettings"]["network"] == "xhttp", sp["streamSettings"]
-        assert sp["streamSettings"]["xhttpSettings"]["path"] == "/p"
-    finally:
-        globals()["ALLOW_XHTTP"] = False
+    # splithttp is xhttp's old name, and must reach the same settings block
+    sp = parse("vless://u@a.com:443?type=splithttp&path=%2Fp&host=h.com", "t")
+    assert sp["streamSettings"]["network"] == "xhttp", sp["streamSettings"]
+    assert sp["streamSettings"]["xhttpSettings"]["path"] == "/p"
 
     # ---- dedupe keys on the CONFIGURATION, not the server ---------------
     # Same host, same credential, different transport. node_id cannot tell
@@ -1755,13 +1698,6 @@ if __name__ == "__main__":
     p_pool = sub.add_parser("pool", help="write node files for one subscription")
     p_pool.add_argument("source", nargs="?", help="subscription file; omit for stdin")
     p_pool.add_argument("--name", default="main", help="pool name, namespaces the tags")
-    p_pool.add_argument("--xhttp", action="store_true",
-                        help="include xhttp/splithttp nodes. Off by default: "
-                             "they segfault xray 26.3.27 at DISPATCH, which "
-                             "xray -test cannot catch and which takes the whole "
-                             "proxy down on whichever connection picks one. "
-                             "Fixed upstream after 26.3.27 - safe to enable on "
-                             "a newer xray.")
     p_pool.add_argument("--size", type=int, default=0, metavar="N",
                         help="nodes per file; 0 (default) puts them all in one")
     p_pool.add_argument("--limit", type=int, default=0, metavar="N",
@@ -1832,7 +1768,6 @@ if __name__ == "__main__":
         if not os.path.exists(os.path.join(args.outdir, ROUTING)):
             sys.exit(f"{args.outdir}/{ROUTING} missing - run: sub2xray.py "
                      f"--outdir {args.outdir} init")
-        ALLOW_XHTTP = args.xhttp
         src = open(args.source).read() if args.source else sys.stdin.read()
         outbounds = build(src, args.name)["outbounds"]
         # Named, not silent. Dropping most of a subscription without a word is

@@ -30,10 +30,6 @@
 #   REFRESH_EVERY=30      seconds between checks
 #   REFRESH_MAX=1800      give up after this long and publish nothing
 #   REFRESH_FETCH_USER=xray   whose uid the ruleset exempts from capture
-#   REFRESH_XHTTP=1       include xhttp/splithttp nodes. Off by default: they
-#                         segfault xray 26.3.27 at DISPATCH, which xray -test
-#                         cannot catch. Fixed upstream after that release, so
-#                         set this once you are on a newer build
 #   REFRESH_LIMIT=150     nodes kept per subscription
 #   REFRESH_SIZE=50       nodes per pool file
 #   XRAY_CONFDIR=/etc/xray/conf
@@ -81,7 +77,6 @@ LIMIT="${REFRESH_LIMIT:-150}"
 SIZE="${REFRESH_SIZE:-50}"
 CURL_TIMEOUT="${REFRESH_CURL_TIMEOUT:-60}"
 FETCH_USER="${REFRESH_FETCH_USER:-xray}"
-XHTTP="${REFRESH_XHTTP:-}"
 LOCK="${REFRESH_LOCK:-/run/xray-refresh.lock}"
 RUNTEST=0
 for a in "$@"; do case "$a" in
@@ -166,11 +161,8 @@ fetch_pools() {
     [[ -s "$tmp" ]] || { say "  $name: empty response - keeping the pool already on disk"; continue; }
     # A subscription that parses to nothing exits non-zero BEFORE write_pool,
     # so the pool on disk survives a bad fetch rather than being emptied by it.
-    # ${XHTTP:+--xhttp} expands to nothing when unset, so the flag is absent
-    # rather than empty - an empty argument would be read as the source file.
     if "$DIR/sub2xray.py" --outdir "$CONFDIR" pool \
-         --name "$name" --limit "$LIMIT" --size "$SIZE" \
-         ${XHTTP:+--xhttp} "$tmp"; then
+         --name "$name" --limit "$LIMIT" --size "$SIZE" "$tmp"; then
       ok=$((ok + 1))
     else
       say "  $name: no usable nodes - keeping the pool already on disk"
@@ -309,7 +301,7 @@ printf 'test\thttps://example.invalid/sub.txt\n# a comment\n' > "$work/subs.txt"
 run() { env REFRESH_NO_ROOT_CHECK=1 XRAY_CONFDIR="$work/conf" REFRESH_SUBS="$work/subs.txt" \
    REFRESH_OUT="$work/out/working.txt" REFRESH_QUIET=2 REFRESH_EVERY=1 \
    REFRESH_MAX=60 REFRESH_LOCK="$work/lock" REFRESH_FETCH_USER="$WHO" \
-   REFRESH_XHTTP="${XH:-}" "$SELF" "$@"; }
+   "$SELF" "$@"; }
 
 out=$(run) || die "a clean cycle exited non-zero: $out"
 grep -q 'refreshed 1 of 1' <<<"$out" || die "the subscription was not pooled: $out"
@@ -339,39 +331,6 @@ ok "the survivors are published 0600, and the pruned node is not among them"
 [[ $(grep -c 'systemctl restart xray.service' "$CALLS") -ge 2 ]] \
   || die "the prune was not followed by its own restart: $(cat "$CALLS")"
 ok "every prune is followed by a restart, or the journal keeps reporting it"
-
-# ⚠ xhttp segfaults xray 26.3.27 at dispatch, so it is excluded unless asked
-# for. The flag has to reach sub2xray or the exclusion is silently permanent.
-xhttp_in_pool() {
-  jq -r '[.outbounds[] | select(.streamSettings.network == "xhttp")] | length' \
-     "$work/conf"/50-pool-test-*.json 2>/dev/null | paste -sd+ | bc
-}
-stub curl <<'EOF'
-echo "curl${INSIDE_RUNUSER:+ (direct)}" >> "$CALLS"
-# xhttp FIRST, so it becomes prox-test-1: the journal stub reports prox-test-2
-# as failing, and the settle loop would otherwise prune the node under test.
-cat <<'URIS'
-vless://ux@x.example:443?type=xhttp&path=%2Fp&security=tls&sni=x.example#xh
-vless://u1@a.example:443?security=tls&sni=a.example#one
-URIS
-EOF
-run >/dev/null 2>&1 || true
-[[ "$(xhttp_in_pool)" == 0 ]] || die "xhttp was pooled without REFRESH_XHTTP"
-XH=1 run >/dev/null 2>&1 || true
-[[ "$(xhttp_in_pool)" == 1 ]] || die "REFRESH_XHTTP did not reach sub2xray: $(xhttp_in_pool)"
-unset XH
-ok "REFRESH_XHTTP passes --xhttp through, and xhttp is excluded without it"
-
-# Back to the three-node subscription the rest of the checks expect.
-stub curl <<'EOF'
-echo "curl${INSIDE_RUNUSER:+ (direct)}" >> "$CALLS"
-[[ -n "${CURL_DIRECT_FAILS:-}" && -n "${INSIDE_RUNUSER:-}" ]] && exit 7
-cat <<'URIS'
-vless://u1@a.example:443?security=tls&sni=a.example#one
-vless://u2@b.example:443?security=tls&sni=b.example#two
-vless://u3@c.example:443?security=tls&sni=c.example#three
-URIS
-EOF
 
 # A host that is blocked on the direct path but reachable through the pool: the
 # retry is the thing stopping the services could never have offered.
