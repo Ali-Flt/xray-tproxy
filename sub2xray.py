@@ -201,8 +201,12 @@ def stream(net, security, sni, host, path, service, fp, pbk, sid):
     """Shared streamSettings - identical between vless and vmess."""
     ss = {"network": net, "security": security, "sockopt": dict(SOCKOPT)}
     if net == "ws":
-        ss["wsSettings"] = {"path": url_path(path or "/"),
-                            "headers": {"Host": host or sni}}
+        # `host`, not headers.Host. xray warns once per outbound that the
+        # header form is "deprecated ... being migrated to independent host"
+        # and will be removed - which with a few hundred ws nodes is most of
+        # the startup log. The xhttp branch below has always used the
+        # independent field and has never drawn a warning.
+        ss["wsSettings"] = {"path": url_path(path or "/"), "host": host or sni}
     elif net == "grpc":
         ss["grpcSettings"] = {"serviceName": service}
     elif net == "xhttp":
@@ -470,7 +474,9 @@ def _stream_query(ss):
     if net == "ws":
         w = ss.get("wsSettings", {})
         q["path"] = w.get("path", "/")
-        host = w.get("headers", {}).get("Host", "")
+        # Either shape: pool files written before the migration carry
+        # headers.Host, and an export must not silently drop it.
+        host = w.get("host") or w.get("headers", {}).get("Host", "")
         if host:
             q["host"] = host
     elif net == "grpc":
@@ -1123,7 +1129,17 @@ def _selftest():
     assert v["settings"]["vnext"][0]["address"] == "ex.com"
     assert v["settings"]["vnext"][0]["users"][0]["id"] == "uid"
     assert v["streamSettings"]["wsSettings"]["path"] == "/p"
-    assert v["streamSettings"]["wsSettings"]["headers"]["Host"] == "h.com"
+    assert v["streamSettings"]["wsSettings"]["host"] == "h.com"
+    assert "headers" not in v["streamSettings"]["wsSettings"], \
+        "headers.Host is deprecated and warns once per outbound"
+    # ...but a pool file written before the migration still exports its host
+    old = {"tag": "t", "protocol": "vless",
+           "settings": {"vnext": [{"address": "a.com", "port": 443,
+                                   "users": [{"id": "u"}]}]},
+           "streamSettings": {"network": "ws", "security": "none",
+                              "wsSettings": {"path": "/p",
+                                             "headers": {"Host": "old.example"}}}}
+    assert "host=old.example" in to_uri(old), to_uri(old)
     assert v["streamSettings"]["tlsSettings"]["serverName"] == "h.com"
     raw = "eyJhZGQiOiJleC5jb20iLCJwb3J0IjoiNDQzIiwiaWQiOiJ1aWQiLCJhaWQiOiIwIiwibmV0Ijoid3MiLCJob3N0IjoiaC5jb20iLCJwYXRoIjoiLyIsInRscyI6InRscyJ9"
     m = parse("vmess://" + raw, "prox-2")
